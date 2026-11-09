@@ -54,17 +54,57 @@ A ready-made helper already exists in the user's dotfiles:
 - `cdp --check` does a raw TCP reachability check only.
 - `cdp` with no flags execs `agent-browser connect <url>`.
 
-Typical flow:
+`cdp --url` on its own is fine for sanity checks, but **do not drive the
+browser with bare `agent-browser connect` / `agent-browser <cmd>`** — see the
+next section.
+
+## Concurrency: always use your own pinned session (via `cb`)
+
+Several agents (parallel Claude Code sessions, subagents, Codex, …) may be
+attached to the same real Chrome at once. Bare `agent-browser` commands all
+go to the shared **`default` session**: one daemon, one "active tab", one set
+of `@eN` refs. Two agents there will navigate each other's tab, invalidate
+each other's refs, and `close`/kill each other's daemon. That is the
+"バッティング" failure mode.
+
+Fix: each agent gets its own `--session` (separate daemon + refs) and
+`--pin-tab` (its own tab in the shared Chrome; other sessions get `tab_locked`
+if they try to take it, and user-opened tabs never steal focus from it).
+The wrapper `scripts/cb` (next to this file) does this for you:
+
 ```bash
-python3 ~/.ghq.d/src/github.com/nabinno/dotfiles/.local/bin/cdp --url     # sanity check / get the URL
-timeout 25 agent-browser connect "$(python3 ~/.ghq.d/src/github.com/nabinno/dotfiles/.local/bin/cdp --url)"
-timeout 20 agent-browser tab list                                        # see existing real tabs
-timeout 25 agent-browser tab new "https://example.com"                   # open what you need
-timeout 20 agent-browser snapshot -i -c                                  # read it
+CB=~/.ghq.d/src/github.com/nabinno/agent-skills/agent-browser-current-browser/scripts/cb
+$CB new                                   # -> prints e.g. cb-1109233337-daed4a; opens a fresh pinned tab
+$CB cb-1109233337-daed4a open "https://example.com"
+$CB cb-1109233337-daed4a snapshot -i -c
+$CB cb-1109233337-daed4a click @e3
+$CB cb-1109233337-daed4a done             # close ONLY this session's tab and detach
 ```
 
-Always wrap agent-browser calls in `timeout <seconds>` here: a bad/stale CDP
-session can hang indefinitely rather than erroring quickly.
+Rules:
+- Run `cb new` **once per task** and reuse the printed name **literally** in
+  every later command. Each tool call is a fresh shell, so `export
+  AGENT_BROWSER_SESSION=...` does not persist; and don't derive it from cwd
+  (`session id --scope worktree`) — parallel agents often share a cwd and
+  would collide on the same name.
+- If you spawn subagents that use the browser, have each run its own
+  `cb new`; never hand one session name to two concurrent workers.
+- Stay in your pinned tab. Use `open <url>` to navigate it. Only use
+  `tab new` if you really need a second tab, and close it yourself.
+  `tab list` shows the user's/other agents' tabs too — read-only info, don't
+  switch into them unless the user asked you to work in a specific existing tab.
+- If a command returns `tab_gone` (the user closed your tab), recover with
+  `$CB <name> tab new <url>`; don't fall back to another tab.
+- Always finish with `$CB <name> done`. Never run `agent-browser close --all`
+  (cb refuses `--all`), and never use the `default` session.
+- `cb` already wraps each call in `timeout` (`CB_TIMEOUT`, default 25s);
+  raise it for slow pages, e.g. `CB_TIMEOUT=60 $CB <name> wait --load networkidle`.
+- Cookies/login state are shared (same Chrome profile), so concurrent agents
+  logging in/out of the same site can still affect each other — avoid
+  login/logout flows in parallel.
+- `[agent-browser] launched browser` on `cb new` refers to the session daemon;
+  it is attached to the real Chrome (confirm with `tab list` showing the
+  user's tabs).
 
 ## Known gotchas
 
@@ -77,8 +117,10 @@ session can hang indefinitely rather than erroring quickly.
   connect` attempt as the real signals.
 - **A stale `agent-browser` daemon from an earlier, unrelated session** can
   own its own separate (headless or headed) Chrome and confuse things. Check
-  `ps aux | grep agent-browser` and `ps aux | grep chrome` if a connect
-  attempt behaves oddly; kill leftover daemons before retrying.
+  `agent-browser session list` / `ps aux | grep agent-browser` if a connect
+  attempt behaves oddly. **Other `cb-*` sessions may belong to agents running
+  right now — never kill them.** Only clean up your own session (`cb <name>
+  done`); for anything else, ask the user first.
 - **The UUID in `DevToolsActivePort` can go stale** if the toggle was turned
   off and back on. Re-run `cdp --url` to refresh it rather than reusing an
   old value.

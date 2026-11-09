@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# cb — run agent-browser against the user's current Windows Chrome in an
+# isolated, tab-pinned session so several agents can work concurrently.
+#
+#   cb new                 Create a unique session, attach it to the current
+#                          Chrome with --pin-tab (opens its own fresh tab), and
+#                          print the session name. Remember that literal name.
+#   cb <session> <args...> Run `agent-browser --session <session> <args...>`
+#                          with a timeout (CB_TIMEOUT, default 25s).
+#   cb <session> done      Close this session's own tab and detach its daemon.
+#                          Never touches other sessions or the user's tabs.
+#
+# Each shell call is a fresh process, so the session name must be passed
+# explicitly every time (env vars do not survive between agent tool calls).
+set -euo pipefail
+
+CDP_HELPER="${CDP_HELPER:-$HOME/.ghq.d/src/github.com/nabinno/dotfiles/.local/bin/cdp}"
+TIMEOUT="${CB_TIMEOUT:-25}"
+
+die() { echo "cb: $*" >&2; exit 1; }
+ab() { timeout "$TIMEOUT" agent-browser "$@"; }
+
+valid_session() {
+  [[ "$1" =~ ^cb-[A-Za-z0-9_-]+$ ]] || die "session name must look like cb-xxxx (got '$1'); create one with 'cb new'"
+  [[ "$1" != "default" ]] || die "refusing to use the shared default session"
+}
+
+[[ $# -ge 1 ]] || die "usage: cb new | cb <session> <agent-browser args...> | cb <session> done"
+
+case "$1" in
+  new)
+    url="$(python3 "$CDP_HELPER" --url)" || die "could not resolve CDP URL (is remote debugging enabled?)"
+    session="cb-$(date +%m%d%H%M%S)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+    # --pin-tab is sticky per session: attach opens a fresh tab bound to this
+    # session, and other sessions/user tabs can never steal it.
+    ab --session "$session" --pin-tab connect "$url" >/dev/null
+    echo "$session"
+    ;;
+  *)
+    session="$1"; shift
+    valid_session "$session"
+    [[ $# -ge 1 ]] || die "missing agent-browser command"
+    if [[ "$1" == "done" ]]; then
+      ab --session "$session" tab close >/dev/null 2>&1 || true
+      ab --session "$session" close >/dev/null 2>&1 || true
+      echo "cb: session $session released"
+      exit 0
+    fi
+    for a in "$@"; do
+      [[ "$a" == "--all" ]] && die "'--all' would affect other agents' sessions; not allowed via cb"
+    done
+    exec timeout "$TIMEOUT" agent-browser --session "$session" "$@"
+    ;;
+esac
