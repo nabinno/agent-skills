@@ -54,9 +54,10 @@ A ready-made helper already exists in the user's dotfiles:
 - `cdp --check` does a raw TCP reachability check only.
 - `cdp` with no flags execs `agent-browser connect <url>`.
 
-`cdp --url` on its own is fine for sanity checks, but **do not drive the
-browser with bare `agent-browser connect` / `agent-browser <cmd>`** — see the
-next section.
+`cdp --url` only prints the URL (no connection), but **do not connect to it or
+drive the browser with bare `agent-browser connect` / `agent-browser <cmd>`**:
+every direct connection makes Chrome ask for permission again, and bare
+sessions collide. Use `cb` (next section).
 
 ## Concurrency: always use your own pinned session (via `cb`)
 
@@ -74,7 +75,7 @@ The wrapper `scripts/cb` (next to this file) does this for you:
 
 ```bash
 CB=~/.ghq.d/src/github.com/nabinno/agent-skills/agent-browser-current-browser/scripts/cb
-$CB new                                   # -> prints e.g. cb-1109233337-daed4a; opens a fresh pinned tab
+$CB new                                   # -> prints e.g. cb-1109233337-daed4a; opens a pinned background tab
 $CB cb-1109233337-daed4a open "https://example.com"
 $CB cb-1109233337-daed4a snapshot -i -c
 $CB cb-1109233337-daed4a click @e3
@@ -106,6 +107,54 @@ Rules:
   it is attached to the real Chrome (confirm with `tab list` showing the
   user's tabs).
 
+### Background only: never take the user's focus
+
+The user keeps working while agents run, with the Windows taskbar on
+auto-hide. Bringing a Chrome tab/window to the front steals their focus and,
+when Windows refuses the foreground change, flashes Chrome's taskbar button,
+which pops the hidden taskbar up — with several agents, constantly. So cb
+works **entirely in background tabs**:
+
+- Tabs are created in the background, and sessions are bound to tabs by
+  pre-writing agent-browser's pin file and restarting the session daemon.
+  agent-browser's own `tab <tN>` / `tab new` call `Page.bringToFront`, so
+  cb intercepts them. Never call bare `agent-browser … tab …`,
+  `agent-browser connect`, or CDP `Target.activateTarget` /
+  `Page.bringToFront` yourself.
+- Clicks, typing, snapshots and screenshots all work on hidden tabs. A tab
+  that has never been shown drops pointer input, so before input commands
+  cb renders one frame via a 1×1 screenshot (no activation; ~0.1–1 s, at
+  most every 30 s per tab).
+- `$CB <name> show` brings the session's tab to the front of its window.
+  Use it **only when the user asks** to see it ("見せて").
+- Remaining unavoidable cases: a page that opens a popup window (e.g. an
+  OAuth login) may appear in front, and agent-browser may activate a tab it
+  finds unresponsive to revive it.
+
+### One connection to Chrome: cb-hub
+
+With the UI-toggle remote debugging, Chrome asks **"Allow remote debugging?"
+for every new CDP connection**. cb and every agent-browser daemon therefore
+connect through `scripts/cb-hub.mjs`, a local multiplexer that holds the
+single connection to Chrome. The user approves once; it stays valid until
+Chrome quits or debugging is turned off (then the next cb command starts a new
+hub and Chrome asks once more).
+
+- cb starts the hub on demand and prints a note asking the user to approve.
+  If the dialog is denied/dismissed or times out, cb says so — tell the user
+  and retry only after they agree (every retry shows the dialog again).
+- `$CB hub status|start|stop`. Don't stop it without a reason: the next
+  start needs approval again.
+- Never connect to Chrome's real endpoint yourself (`cdp --url`,
+  `agent-browser connect <chrome url>`, scripts with `new WebSocket(...)`):
+  each such connection pops the dialog. For ad-hoc CDP, use the hub URL from
+  `~/.cache/cb/hub.json` (`url`).
+- Security: the hub listens on 127.0.0.1 with a random token in its path
+  (`hub.json`, mode 0600) and refuses `Browser.close`/`Browser.crash`. With
+  WSL mirrored networking, Windows-side processes can reach 127.0.0.1 too;
+  the token is what keeps them out. The user accepted this trade-off
+  (2026-11-10) in exchange for not being asked on every connection.
+
 ## Scoping to a Chrome profile and tab group
 
 The user keeps several Chrome profiles (e.g. Work, Personal) in one
@@ -116,8 +165,8 @@ and one tab group**. Prefer this whenever the user names a profile or group
 ```bash
 $CB profiles                                    # profiles, cb-bridge status, tab groups
 $CB new --group "調査" --profile Work            # main use: work in the user's existing group
-$CB new --own-group --profile Work               # agent gets its own group "🤖 cb-…" in a new window
-$CB new --own-group "資料確認" --profile Work --same-window   # own group, in the user's window
+$CB new --own-group --profile Work               # agent gets its own group "🤖 cb-…" (background tab)
+$CB new --own-group "資料確認" --profile Work --new-window    # own group in a separate window
 ```
 
 - `--profile` accepts the Chrome profile name (`Work`), the signed-in email,
@@ -139,13 +188,13 @@ $CB new --own-group "資料確認" --profile Work --same-window   # own group, i
   closed (ask the user if something should be closed). In an existing
   group, prefer `tab new <url>` over `open <url>` unless the user wants
   you to navigate one of their tabs.
-- Hidden (background) tabs don't receive clicks/keys. Before input commands
-  (anything except `get`/`is`/`snapshot`/`read`/…), cb makes the session's
-  tab the active tab of its window (no window focus/raise). So in the
-  user's window, the visible tab will switch while you work. Two agents doing
-  input in the **same window** take turns being visible; for real parallel
-  input give each agent its own window (`--own-group` default, or have the
-  user put each group in its own window).
+- An own group goes into the profile's last used window as a background
+  tab group. `--new-window` opens a separate (unfocused) window instead;
+  creating a window can still flash the taskbar, so only use it when the
+  user asks for one.
+- Several agents can work in the same group or window at the same time;
+  each stays on its own background tab, and a tab pinned by another session
+  is refused with `tab_locked`.
 - If the same URL+title is open both inside and outside the group, cb can't
   tell which tab is which (it doesn't have the `debugger` permission) and
   refuses to act on it ("ambiguous"). Ask the user to close the duplicate.
@@ -191,6 +240,8 @@ unscoped `cb new` and tell the user.
   attempt behaves oddly. **Other `cb-*` sessions may belong to agents running
   right now — never kill them.** Only clean up your own session (`cb <name>
   done`); for anything else, ask the user first.
+- **Repeated "Allow remote debugging?" dialogs** mean something bypassed
+  cb-hub (see above). `CB_NO_HUB=1` makes cb connect directly; debugging only.
 - **The UUID in `DevToolsActivePort` can go stale** if the toggle was turned
   off and back on. Re-run `cdp --url` to refresh it rather than reusing an
   old value.

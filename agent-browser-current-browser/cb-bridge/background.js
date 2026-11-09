@@ -89,11 +89,10 @@ globalThis.cbBridge = {
     };
   },
 
-  // Create a tab at `url` inside group `groupId`, or inside a new group titled
-  // `title` when groupId is null. A new group goes into a new, unfocused window
-  // (newWindow) so that agents doing input don't fight over the visible tab of
-  // the user's window; otherwise into the last focused window.
-  async createTab({ url, groupId = null, title = "", color = "grey", newWindow = true }) {
+  // Create a background tab at `url` inside group `groupId`, or inside a new
+  // group titled `title` when groupId is null: in the last focused window, or
+  // in a new unfocused window when newWindow is set.
+  async createTab({ url, groupId = null, title = "", color = "grey", newWindow = false }) {
     let windowId, tab;
     if (groupId !== null) {
       windowId = (await chrome.tabGroups.get(groupId)).windowId;
@@ -114,9 +113,8 @@ globalThis.cbBridge = {
     return { tabId: tab.id, groupId };
   },
 
-  // Hidden (background) tabs don't receive input events, so cb makes the
-  // session's tab the active tab of its window before input commands. This
-  // does not focus or raise the window itself.
+  // Make a tab the active tab of its window (does not focus the window).
+  // Only used by `cb <session> show`, on the user's request.
   async activateTab(tabId) {
     await chrome.tabs.update(tabId, { active: true });
     return true;

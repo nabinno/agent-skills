@@ -11,8 +11,8 @@ connection and calls `globalThis.cbBridge.*` (see `background.js`):
 |---|---|
 | `info()` | signed-in email of this profile (matched against Chrome's `Local State` to get the profile name) |
 | `snapshot()` | this profile's tab groups and tabs (url, title, group), plus popups opened from grouped tabs |
-| `createTab()` | open a tab inside a group, or in a new group (by default in a new, unfocused window) |
-| `activateTab()` | make a tab the active tab of its window so it receives input (does not focus the window) |
+| `createTab()` | open a background tab inside a group, or in a new group (in the last used window, or a new unfocused one) |
+| `activateTab()` | make a tab the active tab of its window; only used by `cb <session> show` on the user's request |
 | `closeTabs()` | close tabs `cb` opened itself |
 
 ## Permissions

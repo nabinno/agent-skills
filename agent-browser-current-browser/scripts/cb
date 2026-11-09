@@ -5,17 +5,22 @@
 //
 //   cb new                                   unscoped: fresh pinned tab (last active profile)
 //   cb new --group "調査" [--profile Work]    scope = an existing tab group (main use)
-//   cb new --own-group [TITLE] [--profile Work] [--same-window]
+//   cb new --own-group [TITLE] [--profile Work] [--new-window]
 //                                            scope = a new group created for this agent
-//                                            (in a new unfocused window unless --same-window)
+//                                            (in the profile's last used window, or a new one)
 //   cb profiles                              profiles, cb-bridge status and tab groups
 //   cb install-bridge                        copy cb-bridge to Windows for "Load unpacked"
+//   cb hub [status|start|stop]               the shared Chrome connection (see cb-hub.mjs)
 //
 //   cb <session> <agent-browser args...>     run a command in the session (scope-checked)
 //   cb <session> tab list | tab <tN> | tab new [url] | tab close [tN]
 //   cb <session> scope                       show the session's scope
 //   cb <session> allow <tN>                  add an out-of-scope tab (only on the user's say-so)
+//   cb <session> show                        bring the session's tab to the front (only when asked)
 //   cb <session> done                        close tabs cb opened, detach the session
+//
+// Everything runs in background tabs: cb never activates a tab or window on its
+// own (that steals focus and flashes the Windows taskbar).
 //
 // Scoping is a guardrail against mistakes, not a security boundary: the CDP
 // connection itself can control the whole browser.
@@ -24,7 +29,7 @@
 // reached over CDP. Profiles are identified by matching the signed-in email it
 // reports against Chrome's "Local State".
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -37,7 +42,13 @@ const BRIDGE_ID = "haagbfgnipgidagcllndobiiiejdnpjl"; // fixed by manifest "key"
 const CDP_HELPER =
   process.env.CDP_HELPER ?? path.join(os.homedir(), ".ghq.d/src/github.com/nabinno/dotfiles/.local/bin/cdp");
 const TIMEOUT_S = Number(process.env.CB_TIMEOUT ?? 25);
-const STATE_DIR = path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"), "cb", "sessions");
+const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"), "cb");
+const STATE_DIR = path.join(CACHE_DIR, "sessions");
+const HUB_SCRIPT = path.join(HERE, "cb-hub.mjs");
+const HUB_STATE = path.join(CACHE_DIR, "hub.json");
+const HUB_LOG = path.join(CACHE_DIR, "hub.log");
+const HUB_LOCK = path.join(CACHE_DIR, "hub.lock");
+const HUB_WAIT_MS = 150_000;
 const SESSION_RE = /^cb-[A-Za-z0-9_-]+$/;
 const BRIDGE_MIN_VERSION = [0, 2, 0];
 const versionOk = (v) => {
@@ -58,10 +69,94 @@ function run(cmd, args, { timeout = TIMEOUT_S, input } = {}) {
   return { code: r.status, out: r.stdout ?? "", err: r.stderr ?? "" };
 }
 
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+function pidAlive(pid) {
+  try {
+    // a detached child that exited stays a zombie until reaped; treat that as dead
+    return !/^\d+ \(.*\) Z/.test(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+// The real Chrome endpoint (only cb-hub connects to it).
+function chromeUrl() {
+  const env = { ...process.env, CDP_CHROME_USER_DATA_DIR: userDataDir().chrome };
+  const r = spawnSync("timeout", ["20", "python3", CDP_HELPER, "--url"], { encoding: "utf8", env });
+  if (r.status !== 0) die(`could not resolve Chrome's CDP URL (is remote debugging enabled?)\n${(r.stderr ?? "").trim()}`);
+  return r.stdout.trim();
+}
+
+function readHub() {
+  try {
+    const st = JSON.parse(fs.readFileSync(HUB_STATE, "utf8"));
+    if (pidAlive(st.pid)) return st;
+  } catch {}
+  return null;
+}
+
+// Every new CDP connection makes Chrome ask "Allow remote debugging?". So cb
+// and all agent-browser daemons connect through one long-lived cb-hub, which
+// holds the single (approved once) connection to Chrome. Started on demand;
+// it exits when Chrome quits or debugging is turned off.
+function startHub() {
+  fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + HUB_WAIT_MS;
+  let lock;
+  while (lock === undefined) {
+    const hub = readHub();
+    if (hub) return hub;
+    try {
+      lock = fs.openSync(HUB_LOCK, "wx"); // only one cb starts the hub (one dialog)
+    } catch {
+      const st = fs.statSync(HUB_LOCK, { throwIfNoEntry: false });
+      if (st && Date.now() - st.mtimeMs > HUB_WAIT_MS) fs.rmSync(HUB_LOCK, { force: true });
+      if (Date.now() > deadline) die("timed out waiting for another cb to connect to Chrome");
+      sleepSync(500);
+    }
+  }
+  try {
+    const hub = readHub();
+    if (hub) return hub;
+    const out = fs.openSync(HUB_LOG, "a", 0o600);
+    const child = spawn(process.execPath, [HUB_SCRIPT, chromeUrl(), HUB_STATE], { detached: true, stdio: ["ignore", out, out] });
+    child.unref();
+    process.stderr.write(
+      'cb: connecting to Chrome. If Chrome asks "Allow remote debugging?", allow it once; cb reuses this connection from now on.\n',
+    );
+    while (Date.now() < deadline) {
+      const h = readHub();
+      if (h) return h;
+      if (!pidAlive(child.pid))
+        die(`Chrome refused the connection (permission dialog denied, dismissed or timed out?). See ${HUB_LOG}`);
+      sleepSync(300);
+    }
+    die("timed out waiting for Chrome's remote-debugging permission");
+  } finally {
+    fs.closeSync(lock);
+    fs.rmSync(HUB_LOCK, { force: true });
+  }
+}
+
+let CDP_URL;
 function cdpUrl() {
-  const r = run("python3", [CDP_HELPER, "--url"], { timeout: 20 });
-  if (r.code !== 0) die(`could not resolve CDP URL (is remote debugging enabled?)\n${r.err.trim()}`);
-  return r.out.trim();
+  if (CDP_URL) return CDP_URL;
+  if (process.env.CB_NO_HUB) return (CDP_URL = chromeUrl()); // debugging only: prompts on every connection
+  return (CDP_URL = (readHub() ?? startHub()).url);
+}
+
+function cmdHub(sub = "status") {
+  const hub = readHub();
+  if (sub === "status") {
+    if (!hub) return console.log("cb-hub: not running (starts on the next cb command)");
+    console.log(`cb-hub: running (pid ${hub.pid}) -> ${hub.upstream}`);
+  } else if (sub === "stop") {
+    if (hub) process.kill(hub.pid, "SIGTERM");
+    console.log(hub ? "cb-hub: stopped (the next cb command reconnects and Chrome asks once)" : "cb-hub: not running");
+  } else if (sub === "start") {
+    console.log(`cb-hub: running (pid ${(hub ?? startHub()).pid})`);
+  } else die("usage: cb hub [status|start|stop]");
 }
 
 function ab(session, args, opts) {
@@ -82,15 +177,24 @@ function abJson(session, args) {
 
 const abTabs = (session) => abJson(session, ["tab", "list"]).tabs;
 
+let USER_DATA;
 function userDataDir() {
   if (process.env.CDP_CHROME_USER_DATA_DIR) return { local: null, chrome: process.env.CDP_CHROME_USER_DATA_DIR };
+  if (USER_DATA) return USER_DATA;
+  const cache = path.join(CACHE_DIR, "userdata.json"); // powershell.exe is slow; the path doesn't change
+  try {
+    return (USER_DATA = JSON.parse(fs.readFileSync(cache, "utf8")));
+  } catch {}
   const r = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Write-Output $env:LOCALAPPDATA"], {
     timeout: 15,
   });
   const win = r.out.trim();
   if (!win) die("could not read Windows LOCALAPPDATA");
   const u = run("wslpath", ["-u", win]).out.trim();
-  return { local: u, chrome: path.join(u, "Google/Chrome/User Data") };
+  USER_DATA = { local: u, chrome: path.join(u, "Google/Chrome/User Data") };
+  fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(cache, JSON.stringify(USER_DATA));
+  return USER_DATA;
 }
 
 function localStateProfiles() {
@@ -131,7 +235,7 @@ class Cdp {
     };
     try {
       await new Promise((res, rej) => {
-        const t = setTimeout(() => rej(new CbError("CDP connect timed out")), 8_000);
+        const t = setTimeout(() => rej(new CbError("CDP connect timed out")), 15_000);
         c.ws.onopen = () => (clearTimeout(t), res());
         c.ws.onerror = () => (clearTimeout(t), rej(new CbError("CDP connect failed")));
       });
@@ -288,17 +392,78 @@ function saveState(st) {
 
 // ---------------------------------------------------------------- binding
 
-function tabRefFor(session, targetId) {
-  const t = abTabs(session).find((x) => x.targetId === targetId);
-  if (!t) die(`agent-browser does not see target ${targetId}`);
-  return t.tabId;
+// agent-browser's own tab switch (`tab tN`) and `tab new` call Page.bringToFront /
+// create a foreground tab. On Windows that steals OS focus and, when Chrome may
+// not take the foreground, flashes its taskbar button (popping up an auto-hidden
+// taskbar). cb therefore never uses them: it creates tabs in the background and
+// binds a session by pre-writing agent-browser's per-session pin file and
+// (re)starting the session's daemon, which reattaches without activating.
+// Input, snapshots and screenshots all work on hidden tabs.
+
+function socketDir() {
+  if (process.env.AGENT_BROWSER_SOCKET_DIR) return process.env.AGENT_BROWSER_SOCKET_DIR;
+  if (process.env.XDG_RUNTIME_DIR) return path.join(process.env.XDG_RUNTIME_DIR, "agent-browser");
+  return path.join(os.homedir(), ".agent-browser");
+}
+
+function daemonAlive(dir, session) {
+  try {
+    process.kill(Number(fs.readFileSync(path.join(dir, `${session}.pid`), "utf8")), 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// agent-browser enforces tab_locked only on its own tab switch, so check pins of
+// other live sessions ourselves.
+function pinnedByOther(session, targetId) {
+  const dir = socketDir();
+  let files = [];
+  try {
+    files = fs.readdirSync(dir);
+  } catch {}
+  for (const f of files) {
+    if (!f.endsWith(".target") || f === `${session}.target`) continue;
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+      const owner = f.slice(0, -".target".length);
+      if (j.pinned && j.targetId === targetId && daemonAlive(dir, owner)) return owner;
+    } catch {}
+  }
+  return null;
 }
 
 function bind(session, targetId, { soft = false } = {}) {
-  const r = ab(session, ["--pin-tab", "tab", tabRefFor(session, targetId)]);
-  if (r.code === 0) return true;
-  if (soft && /tab_locked/.test(r.err + r.out)) return false; // pinned by another agent
-  die(`could not bind session to tab: ${(r.err || r.out).trim()}`);
+  const owner = pinnedByOther(session, targetId);
+  if (owner) {
+    if (soft) return false;
+    die(`tab_locked: that tab is pinned by session '${owner}'; use another tab`);
+  }
+  const dir = socketDir();
+  if (daemonAlive(dir, session)) ab(session, ["close"]); // detach only; tabs stay open
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${session}.target`), JSON.stringify({ targetId, url: "", pinned: true }));
+  const r = ab(session, ["--pin-tab", "connect", cdpUrl()]);
+  if (r.code !== 0) die(`connect failed: ${(r.err || r.out).trim()}`);
+  const active = abTabs(session).find((x) => x.active);
+  if (active?.targetId !== targetId)
+    die("agent-browser did not reattach to the requested tab (did its session file format change?)");
+  return true;
+}
+
+// Background tab via plain CDP (unscoped sessions): lands in the last active
+// window of the last active profile, without activating it.
+async function newBackgroundTarget(state, url = "about:blank") {
+  const cdp = await Cdp.open(cdpUrl());
+  try {
+    const { targetId } = await cdp.send("Target.createTarget", { url, background: true });
+    (state.created ??= []).push({ targetId });
+    saveState(state);
+    return targetId;
+  } finally {
+    cdp.close();
+  }
 }
 
 function resolveRef(session, ref) {
@@ -338,12 +503,12 @@ async function newScopedTab(env, state, scope) {
 // ---------------------------------------------------------------- commands
 
 function parseNewArgs(argv) {
-  const o = { profile: null, group: null, own: false, ownTitle: null, sameWindow: false };
+  const o = { profile: null, group: null, own: false, ownTitle: null, newWindow: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--profile") o.profile = argv[++i];
     else if (a === "--group") o.group = argv[++i];
-    else if (a === "--same-window") o.sameWindow = true;
+    else if (a === "--new-window") o.newWindow = true;
     else if (a === "--own-group") {
       o.own = true;
       if (argv[i + 1] && !argv[i + 1].startsWith("--")) o.ownTitle = argv[++i];
@@ -357,12 +522,18 @@ function parseNewArgs(argv) {
 async function cmdNew(argv) {
   const o = parseNewArgs(argv);
   const session = `cb-${new Date().toISOString().replace(/\D/g, "").slice(4, 14)}-${randomBytes(3).toString("hex")}`;
-  const url = cdpUrl();
+  cdpUrl();
 
   if (!o.group && !o.own) {
-    const r = ab(session, ["--pin-tab", "connect", url]);
-    if (r.code !== 0) die(`connect failed: ${(r.err || r.out).trim()}`);
-    saveState({ session, mode: "unscoped" });
+    const state = { session, mode: "unscoped", created: [] };
+    saveState(state);
+    try {
+      bind(session, await newBackgroundTarget(state));
+    } catch (e) {
+      ab(session, ["close"]);
+      fs.rmSync(statePath(session), { force: true });
+      throw e;
+    }
     console.log(session);
     return;
   }
@@ -389,12 +560,9 @@ async function cmdNew(argv) {
       profile: bridge.profile,
       groupId: group?.groupId ?? null,
       groupTitle: group?.title ?? o.ownTitle ?? `🤖 ${session}`,
-      newWindow: o.own && !o.sameWindow,
+      newWindow: o.own && o.newWindow,
     });
 
-    // attach without --pin-tab (no stray tab), then pin to an in-scope tab
-    const r = ab(session, ["connect", url]);
-    if (r.code !== 0) die(`connect failed: ${(r.err || r.out).trim()}`);
     saveState(state);
 
     if (o.own) {
@@ -403,14 +571,11 @@ async function cmdNew(argv) {
       const scope = await computeScope(env, state);
       const snap = await bridge.call("snapshot");
       const order = snap.tabs.filter((t) => t.groupId === group.groupId).sort((a, b) => b.active - a.active || a.index - b.index);
-      // agent-browser hides chrome:// pages (e.g. a group's New Tab), so only pick tabs it can see
-      const visible = new Set(abTabs(session).map((t) => t.targetId));
+      // agent-browser hides chrome:// etc. pages (e.g. a group's New Tab), so only pick tabs it can drive
+      const drivable = (u) => /^(https?|file|data):|^about:blank/.test(u);
       const cand = order
-        .map((t) =>
-          scope.pages.find(
-            (p) => p.url === t.url && p.title === t.title && scope.targets.has(p.targetId) && visible.has(p.targetId),
-          ),
-        )
+        .filter((t) => drivable(t.url))
+        .map((t) => scope.pages.find((p) => p.url === t.url && p.title === t.title && scope.targets.has(p.targetId)))
         .filter(Boolean);
       // skip tabs another agent has pinned; if none is free, work in a fresh tab inside the group
       let bound = false;
@@ -474,13 +639,34 @@ async function cmdSession(session, argv) {
 
   if (state.mode === "unscoped") {
     if (argv[0] === "done") {
-      ab(session, ["tab", "close"]);
-      ab(session, ["close"]);
+      ab(session, ["close"]); // detach first, then close the tabs cb opened (no tab switching)
+      const cdp = await Cdp.open(cdpUrl());
+      try {
+        for (const c of state.created ?? []) await cdp.send("Target.closeTarget", { targetId: c.targetId }).catch(() => {});
+      } finally {
+        cdp.close();
+      }
       fs.rmSync(statePath(session), { force: true });
+      fs.rmSync(path.join(socketDir(), `${session}.target`), { force: true });
       console.log(`cb: session ${session} released`);
       return;
     }
     if (argv[0] === "scope" || argv[0] === "allow") die("this session is unscoped (created without --group/--own-group)");
+    const [cmd, sub, arg] = argv;
+    if (cmd === "show") return showTab(session, null);
+    if (cmd === "tab" && sub === "new") {
+      bind(session, await newBackgroundTarget(state));
+      if (arg) passthrough(session, ["open", arg]);
+      console.log("cb: opened a new background tab");
+      return;
+    }
+    if (cmd === "tab" && sub && !["list", "close"].includes(sub) && !sub.startsWith("-")) {
+      const t = resolveRef(session, sub);
+      bind(session, t.targetId);
+      console.log(`cb: switched to ${sub} - ${t.url}`);
+      return;
+    }
+    await primeIfNeeded(state, session, argv);
     passthrough(session, argv);
     return;
   }
@@ -496,9 +682,11 @@ async function cmdSession(session, argv) {
       if (created.length) await scope.bridge.call("closeTabs", created.map((c) => c.tabId));
       ab(session, ["close"]); // detaches only; user's tabs stay open
       fs.rmSync(statePath(session), { force: true });
+      fs.rmSync(path.join(socketDir(), `${session}.target`), { force: true });
       console.log(`cb: session ${session} released (closed ${created.length} tab(s) it opened)`);
       return;
     }
+    if (cmd === "show") return showTab(session, scope);
     if (cmd === "scope") {
       console.log(`profile: ${state.profile.name} <${state.profile.email}>`);
       console.log(`group:   "${state.groupTitle}" ${scope.group ? "" : "(gone)"} mode=${state.mode}`);
@@ -557,7 +745,7 @@ async function cmdSession(session, argv) {
         `the session's current tab is outside its scope ("${state.groupTitle}") or gone.\n` +
           "Use 'tab list' and 'tab <tN>' to pick an in-scope tab, or 'tab new <url>'.",
       );
-    if (!READ_ONLY.has(cmd)) await activate(env, scope, active.targetId);
+    await primeIfNeeded(state, session, argv, active.targetId, env.cdp);
     code = passthrough(session, argv, false);
   } finally {
     env.cdp.close();
@@ -565,15 +753,51 @@ async function cmdSession(session, argv) {
   process.exitCode = code;
 }
 
-// Commands that work fine on a hidden tab; everything else (click, fill, type,
-// press, scroll, screenshot, ...) needs the tab to be visible in its window.
-const READ_ONLY = new Set(["get", "is", "snapshot", "read", "cookies", "storage", "console", "errors", "network", "session", "scope"]);
+// A background tab that has never been shown has no rendered frame, so Chrome
+// drops pointer input (clicks "succeed" but never reach the page). Capturing a
+// 1x1 screenshot renders a frame without activating the tab or its window.
+const POINTER_INPUT = new Set([
+  "click", "dblclick", "hover", "drag", "mouse", "check", "uncheck", "select",
+  "scroll", "scrollintoview", "upload", "download", "find", "focus", "press", "keyboard", "type", "fill",
+]);
+const PRIME_TTL_MS = 30_000;
 
-async function activate(env, scope, targetId) {
-  const tabId = scope.tabIdOf.get(targetId);
+async function primeIfNeeded(state, session, argv, targetId, sharedCdp) {
+  if (!POINTER_INPUT.has(argv[0])) return;
+  targetId ??= abTabs(session).find((x) => x.active)?.targetId;
+  if (!targetId) return;
+  const primed = (state.primed ??= {});
+  if (Date.now() - (primed[targetId] ?? 0) < PRIME_TTL_MS) return;
+  const cdp = sharedCdp ?? (await Cdp.open(cdpUrl()));
+  try {
+    const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+    await cdp
+      .send("Page.captureScreenshot", { clip: { x: 0, y: 0, width: 1, height: 1, scale: 1 } }, sessionId)
+      .catch(() => {});
+    await cdp.send("Target.detachFromTarget", { sessionId }).catch(() => {});
+  } finally {
+    if (!sharedCdp) cdp.close();
+  }
+  primed[targetId] = Date.now();
+  saveState(state);
+}
+
+// Only on the user's request ("見せて"): bring the session's tab to the front of
+// its window so they can watch it. Never used automatically.
+async function showTab(session, scope) {
+  const active = abTabs(session).find((x) => x.active);
+  if (!active) die("the session has no tab");
+  const tabId = scope?.tabIdOf.get(active.targetId);
   if (tabId !== undefined) await scope.bridge.call("activateTab", tabId);
-  else await env.cdp.send("Target.activateTarget", { targetId }); // fallback; may raise the window
-  await new Promise((r) => setTimeout(r, 150));
+  else {
+    const cdp = await Cdp.open(cdpUrl());
+    try {
+      await cdp.send("Target.activateTarget", { targetId: active.targetId });
+    } finally {
+      cdp.close();
+    }
+  }
+  console.log(`cb: showing ${active.tabId} - ${active.url}`);
 }
 
 function printTabs(session, scope) {
@@ -601,6 +825,7 @@ try {
   } else if (first === "new") await cmdNew(rest);
   else if (first === "profiles" || first === "groups") await cmdProfiles();
   else if (first === "install-bridge") cmdInstallBridge();
+  else if (first === "hub") cmdHub(rest[0]);
   else await cmdSession(first, rest);
 } catch (e) {
   if (!(e instanceof CbError)) throw e;
