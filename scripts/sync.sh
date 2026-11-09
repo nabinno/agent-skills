@@ -9,7 +9,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-CLAUDE_SKILLS="${CLAUDE_HOME:-$HOME/.claude}/skills"
+CLAUDE_SKILLS="${CLAUDE_HOME:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}/skills"
 CODEX_SKILLS="${CODEX_HOME:-$HOME/.codex}/skills"
 GROK_SKILLS="${GROK_HOME:-$HOME/.grok}/skills"
 

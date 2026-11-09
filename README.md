@@ -24,7 +24,7 @@ ghq get nabinno/agent-skills
 
 This symlinks every skill here into:
 
-- `~/.claude/skills/<name>` (Claude Code)
+- `~/.claude/skills/<name>` (Claude Code — or `$CLAUDE_HOME` / `$CLAUDE_CONFIG_DIR` if set)
 - `~/.codex/skills/<name>` (Codex — leaves the reserved `.system/` subdir alone)
 - `~/.grok/skills/<name>` (Grok)
 
