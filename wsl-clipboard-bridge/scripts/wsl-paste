@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Print the Windows clipboard's text to stdout from WSL2, preserving UTF-8.
+#
+# Reading Get-Clipboard's output straight through the WSL interop pipe
+# mangles non-ASCII text (console codepage again), so this routes through a
+# file written with `Out-File -Encoding utf8` instead. Windows PowerShell
+# 5.1 (powershell.exe) always adds a UTF-8 BOM for that encoding; strip it
+# so downstream WSL tools that assume plain UTF-8 don't choke on it.
+#
+# Usage:
+#   wsl-paste
+#   wsl-paste > file.txt
+set -euo pipefail
+
+WIN_TMP_DIR="/mnt/c/Users/Public"
+DUMP="$WIN_TMP_DIR/.wsl-paste-dump.txt"
+GETTER="$WIN_TMP_DIR/.wsl-paste-get.ps1"
+
+cat > "$GETTER" <<'PS1EOF'
+Get-Clipboard -Raw | Out-File -FilePath "C:\Users\Public\.wsl-paste-dump.txt" -Encoding utf8
+PS1EOF
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Public\.wsl-paste-get.ps1"
+
+sed '1s/^\xef\xbb\xbf//' "$DUMP"
+rm -f "$DUMP" "$GETTER"

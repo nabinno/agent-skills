@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Copy text into the Windows clipboard from WSL2, preserving UTF-8 (e.g.
+# Japanese) correctly.
+#
+# clip.exe uses the legacy console codepage and mangles non-ASCII text, so
+# this goes through PowerShell's Set-Clipboard instead. The content is
+# written to a file first and read back with an explicit .ps1 script —
+# piping text inline through `powershell.exe -Command "..."` gets mangled
+# by the invoking shell's own `$`-expansion (see sibling skill
+# agent-browser-current-browser for the same gotcha).
+#
+# Usage:
+#   wsl-copy "some text"
+#   wsl-copy path/to/file.txt
+#   echo "some text" | wsl-copy
+set -euo pipefail
+
+WIN_TMP_DIR="/mnt/c/Users/Public"
+PAYLOAD="$WIN_TMP_DIR/.wsl-copy-payload.txt"
+SETTER="$WIN_TMP_DIR/.wsl-copy-set.ps1"
+
+if [ "$#" -gt 0 ] && [ -f "$1" ]; then
+  cp "$1" "$PAYLOAD"
+elif [ "$#" -gt 0 ]; then
+  printf '%s' "$*" > "$PAYLOAD"
+else
+  cat > "$PAYLOAD"
+fi
+
+cat > "$SETTER" <<'PS1EOF'
+$content = Get-Content -Path "C:\Users\Public\.wsl-copy-payload.txt" -Raw -Encoding UTF8
+Set-Clipboard -Value $content
+PS1EOF
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Public\.wsl-copy-set.ps1"
+
+CHARS="$(wc -m < "$PAYLOAD" | tr -d ' ')"
+rm -f "$PAYLOAD" "$SETTER"
+echo "Copied to Windows clipboard ($CHARS chars)." >&2
