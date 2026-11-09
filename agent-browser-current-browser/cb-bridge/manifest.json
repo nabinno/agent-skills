@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "cb-bridge (agent-browser scope helper)",
+  "version": "0.2.0",
+  "description": "Lets the agent-skills `cb` wrapper scope agent-browser sessions to a Chrome profile and tab group. No UI, no content scripts, no network access.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAhwYkx6F0NeDe8SyjFgr6bbkudp7lKEjR3tEdZOOygtguTizvBWx50KcAlyiDRPLeXdbD/qlZYYQv4+AmQqtqi3q4EUZY6/IWrtl0m6i8593qL1QhE7LukfIRlgrQyWyYaD9zcaJq4Z7NGzpV080DGdTa33WWIfE1v2tG7YT70Dm7jKfhRTuLIipN1+n6icGCRPyPL0q2CW9jBBCLWULUtww4t4vnjkph1WP0qxKEFv3gx8JXpgv0pDFR0hZNO3nZFnOqF5qnxecEV98tRmOz+eUEQuvYUvrs5wDrhzJeBLMRKP7ELjX2117gVRAFRfhn/DhVTJ7MBFplD6cEXRl6YQIDAQAB",
+  "minimum_chrome_version": "144",
+  "permissions": ["tabs", "tabGroups", "storage", "identity", "identity.email"],
+  "background": { "service_worker": "background.js" }
+}

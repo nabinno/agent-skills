@@ -1,54 +1,610 @@
-#!/usr/bin/env bash
-# cb — run agent-browser against the user's current Windows Chrome in an
-# isolated, tab-pinned session so several agents can work concurrently.
-#
-#   cb new                 Create a unique session, attach it to the current
-#                          Chrome with --pin-tab (opens its own fresh tab), and
-#                          print the session name. Remember that literal name.
-#   cb <session> <args...> Run `agent-browser --session <session> <args...>`
-#                          with a timeout (CB_TIMEOUT, default 25s).
-#   cb <session> done      Close this session's own tab and detach its daemon.
-#                          Never touches other sessions or the user's tabs.
-#
-# Each shell call is a fresh process, so the session name must be passed
-# explicitly every time (env vars do not survive between agent tool calls).
-set -euo pipefail
+#!/usr/bin/env node
+// cb — run agent-browser against the user's current Windows Chrome in an
+// isolated, tab-pinned session, optionally scoped to a Chrome profile and a
+// tab group, so several agents can work concurrently without colliding.
+//
+//   cb new                                   unscoped: fresh pinned tab (last active profile)
+//   cb new --group "調査" [--profile Work]    scope = an existing tab group (main use)
+//   cb new --own-group [TITLE] [--profile Work] [--same-window]
+//                                            scope = a new group created for this agent
+//                                            (in a new unfocused window unless --same-window)
+//   cb profiles                              profiles, cb-bridge status and tab groups
+//   cb install-bridge                        copy cb-bridge to Windows for "Load unpacked"
+//
+//   cb <session> <agent-browser args...>     run a command in the session (scope-checked)
+//   cb <session> tab list | tab <tN> | tab new [url] | tab close [tN]
+//   cb <session> scope                       show the session's scope
+//   cb <session> allow <tN>                  add an out-of-scope tab (only on the user's say-so)
+//   cb <session> done                        close tabs cb opened, detach the session
+//
+// Scoping is a guardrail against mistakes, not a security boundary: the CDP
+// connection itself can control the whole browser.
+//
+// Profile/tab-group information comes from the cb-bridge extension (../cb-bridge),
+// reached over CDP. Profiles are identified by matching the signed-in email it
+// reports against Chrome's "Local State".
 
-CDP_HELPER="${CDP_HELPER:-$HOME/.ghq.d/src/github.com/nabinno/dotfiles/.local/bin/cdp}"
-TIMEOUT="${CB_TIMEOUT:-25}"
+import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-die() { echo "cb: $*" >&2; exit 1; }
-ab() { timeout "$TIMEOUT" agent-browser "$@"; }
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const BRIDGE_DIR = path.resolve(HERE, "../cb-bridge");
+const BRIDGE_ID = "haagbfgnipgidagcllndobiiiejdnpjl"; // fixed by manifest "key"
+const CDP_HELPER =
+  process.env.CDP_HELPER ?? path.join(os.homedir(), ".ghq.d/src/github.com/nabinno/dotfiles/.local/bin/cdp");
+const TIMEOUT_S = Number(process.env.CB_TIMEOUT ?? 25);
+const STATE_DIR = path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"), "cb", "sessions");
+const SESSION_RE = /^cb-[A-Za-z0-9_-]+$/;
+const BRIDGE_MIN_VERSION = [0, 2, 0];
+const versionOk = (v) => {
+  const a = String(v).split(".").map(Number);
+  for (let i = 0; i < 3; i++) if ((a[i] ?? 0) !== BRIDGE_MIN_VERSION[i]) return (a[i] ?? 0) > BRIDGE_MIN_VERSION[i];
+  return true;
+};
 
-valid_session() {
-  [[ "$1" =~ ^cb-[A-Za-z0-9_-]+$ ]] || die "session name must look like cb-xxxx (got '$1'); create one with 'cb new'"
-  [[ "$1" != "default" ]] || die "refusing to use the shared default session"
+class CbError extends Error {}
+const die = (msg) => {
+  throw new CbError(msg);
+};
+
+// ---------------------------------------------------------------- helpers
+
+function run(cmd, args, { timeout = TIMEOUT_S, input } = {}) {
+  const r = spawnSync("timeout", [String(timeout), cmd, ...args], { encoding: "utf8", input });
+  return { code: r.status, out: r.stdout ?? "", err: r.stderr ?? "" };
 }
 
-[[ $# -ge 1 ]] || die "usage: cb new | cb <session> <agent-browser args...> | cb <session> done"
+function cdpUrl() {
+  const r = run("python3", [CDP_HELPER, "--url"], { timeout: 20 });
+  if (r.code !== 0) die(`could not resolve CDP URL (is remote debugging enabled?)\n${r.err.trim()}`);
+  return r.out.trim();
+}
 
-case "$1" in
-  new)
-    url="$(python3 "$CDP_HELPER" --url)" || die "could not resolve CDP URL (is remote debugging enabled?)"
-    session="cb-$(date +%m%d%H%M%S)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
-    # --pin-tab is sticky per session: attach opens a fresh tab bound to this
-    # session, and other sessions/user tabs can never steal it.
-    ab --session "$session" --pin-tab connect "$url" >/dev/null
-    echo "$session"
-    ;;
-  *)
-    session="$1"; shift
-    valid_session "$session"
-    [[ $# -ge 1 ]] || die "missing agent-browser command"
-    if [[ "$1" == "done" ]]; then
-      ab --session "$session" tab close >/dev/null 2>&1 || true
-      ab --session "$session" close >/dev/null 2>&1 || true
-      echo "cb: session $session released"
-      exit 0
-    fi
-    for a in "$@"; do
-      [[ "$a" == "--all" ]] && die "'--all' would affect other agents' sessions; not allowed via cb"
-    done
-    exec timeout "$TIMEOUT" agent-browser --session "$session" "$@"
-    ;;
-esac
+function ab(session, args, opts) {
+  return run("agent-browser", ["--session", session, ...args], opts);
+}
+
+function abJson(session, args) {
+  const r = ab(session, [...args, "--json"]);
+  let j;
+  try {
+    j = JSON.parse(r.out);
+  } catch {
+    die(`agent-browser ${args.join(" ")} failed: ${(r.err || r.out).trim()}`);
+  }
+  if (!j.success) die(`agent-browser ${args.join(" ")} failed: ${JSON.stringify(j.error ?? j)}`);
+  return j.data;
+}
+
+const abTabs = (session) => abJson(session, ["tab", "list"]).tabs;
+
+function userDataDir() {
+  if (process.env.CDP_CHROME_USER_DATA_DIR) return { local: null, chrome: process.env.CDP_CHROME_USER_DATA_DIR };
+  const r = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Write-Output $env:LOCALAPPDATA"], {
+    timeout: 15,
+  });
+  const win = r.out.trim();
+  if (!win) die("could not read Windows LOCALAPPDATA");
+  const u = run("wslpath", ["-u", win]).out.trim();
+  return { local: u, chrome: path.join(u, "Google/Chrome/User Data") };
+}
+
+function localStateProfiles() {
+  const ls = JSON.parse(fs.readFileSync(path.join(userDataDir().chrome, "Local State"), "utf8"));
+  return Object.entries(ls.profile?.info_cache ?? {}).map(([dir, v]) => ({
+    dir,
+    name: v.name ?? "",
+    email: (v.user_name ?? "").toLowerCase(),
+  }));
+}
+
+// ---------------------------------------------------------------- CDP
+
+class Cdp {
+  // Chrome occasionally stalls a new CDP handshake; retry a few times.
+  static async open(url, attempts = 3) {
+    for (let i = 1; ; i++) {
+      try {
+        return await Cdp.#openOnce(url);
+      } catch (e) {
+        if (i >= attempts) throw e;
+        await new Promise((r) => setTimeout(r, 500 * i));
+      }
+    }
+  }
+  static async #openOnce(url) {
+    const c = new Cdp();
+    c.ws = new WebSocket(url);
+    c.id = 0;
+    c.pending = new Map();
+    c.ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      const p = m.id && c.pending.get(m.id);
+      if (!p) return;
+      c.pending.delete(m.id);
+      clearTimeout(p.timer);
+      m.error ? p.reject(new CbError(`CDP ${p.method}: ${m.error.message}`)) : p.resolve(m.result);
+    };
+    try {
+      await new Promise((res, rej) => {
+        const t = setTimeout(() => rej(new CbError("CDP connect timed out")), 8_000);
+        c.ws.onopen = () => (clearTimeout(t), res());
+        c.ws.onerror = () => (clearTimeout(t), rej(new CbError("CDP connect failed")));
+      });
+    } catch (e) {
+      c.ws.close(); // an open/connecting socket would keep node alive
+      throw e;
+    }
+    return c;
+  }
+  send(method, params = {}, sessionId) {
+    const id = ++this.id;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) reject(new CbError(`CDP ${method} timed out`));
+      }, 15_000);
+      this.pending.set(id, { resolve, reject, method, timer });
+      this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+    });
+  }
+  close() {
+    this.ws.close();
+  }
+}
+
+// A cb-bridge instance (one per profile it is installed in).
+class Bridge {
+  constructor(cdp, target, profile, info) {
+    Object.assign(this, { cdp, target, profile, info, ctx: target.browserContextId });
+  }
+  async call(fn, arg) {
+    const { sessionId } = await this.cdp.send("Target.attachToTarget", { targetId: this.target.targetId, flatten: true });
+    try {
+      const expr = `globalThis.cbBridge.${fn}(${arg === undefined ? "" : JSON.stringify(arg)})`;
+      const r = await this.cdp.send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true }, sessionId);
+      if (r.exceptionDetails) die(`cb-bridge ${fn}: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text}`);
+      return r.result.value;
+    } finally {
+      await this.cdp.send("Target.detachFromTarget", { sessionId }).catch(() => {});
+    }
+  }
+}
+
+async function connectAll() {
+  const cdp = await Cdp.open(cdpUrl());
+  try {
+    const { targetInfos } = await cdp.send("Target.getTargets");
+    const profiles = localStateProfiles();
+    const bridges = [];
+    for (const t of targetInfos) {
+      if (t.type !== "service_worker" || !t.url.startsWith(`chrome-extension://${BRIDGE_ID}/`)) continue;
+      const b = new Bridge(cdp, t, null, null);
+      b.info = await b.call("info");
+      if (!versionOk(b.info.version))
+        die(`cb-bridge ${b.info.version} is too old (need ${BRIDGE_MIN_VERSION.join(".")}): run 'cb install-bridge', then reload it in chrome://extensions`);
+      const email = b.info.email.toLowerCase();
+      b.profile = profiles.find((p) => email && p.email === email) ?? { dir: "?", name: "(unknown)", email };
+      bridges.push(b);
+    }
+    return { cdp, targets: targetInfos, profiles, bridges };
+  } catch (e) {
+    cdp.close(); // otherwise the open WebSocket keeps node alive
+    throw e;
+  }
+}
+
+function matchProfile(bridges, spec) {
+  if (!spec) return bridges;
+  const s = spec.toLowerCase();
+  const hit = bridges.filter(
+    (b) =>
+      b.profile.name.toLowerCase() === s ||
+      b.profile.dir.toLowerCase() === s ||
+      (b.profile.email && (b.profile.email === s || b.profile.email.endsWith(`@${s.replace(/^@/, "")}`))),
+  );
+  if (!hit.length)
+    die(`no reachable profile matches '${spec}'. Run 'cb profiles' (is that profile open and cb-bridge loaded in it?)`);
+  return hit;
+}
+
+function bridgeFor(env, state) {
+  const b = env.bridges.find((x) => x.profile.email && x.profile.email === state.profile.email);
+  if (!b) die(`profile ${state.profile.name} <${state.profile.email}> is not reachable (closed, or cb-bridge not loaded)`);
+  return b;
+}
+
+// --- scope computation ------------------------------------------------------
+// The extension knows tabs by tabId, CDP/agent-browser by targetId. Without the
+// debugger permission they are matched by (profile, url, title): a CDP target is
+// in scope only if every tab in that profile with the same url+title is in scope.
+
+const key = (url, title) => `${url}\u0000${title}`;
+
+function resolveGroup(snap, state) {
+  let g = snap.groups.find((x) => x.groupId === state.groupId);
+  if (!g && state.groupTitle) {
+    const same = snap.groups.filter((x) => x.title === state.groupTitle);
+    if (same.length === 1) g = same[0];
+  }
+  return g ?? null;
+}
+
+async function computeScope(env, state) {
+  const b = bridgeFor(env, state);
+  let snap = await b.call("snapshot");
+  const g = resolveGroup(snap, state);
+  if (g && g.groupId !== state.groupId) {
+    state.groupId = g.groupId; // ids change across browser restarts
+    saveState(state);
+  }
+  const { targetInfos } = await env.cdp.send("Target.getTargets");
+  const pages = targetInfos.filter((t) => t.type === "page" && t.browserContextId === b.ctx);
+  const inScope = (t) =>
+    g && (t.groupId === g.groupId || (snap.adopted[t.tabId] !== undefined && snap.adopted[t.tabId] === g.groupId));
+  const total = new Map();
+  const scoped = new Map(); // key -> [tabId] of in-scope tabs
+  const allByKey = new Map(); // key -> [tabId] of all tabs (for allowed targets)
+  for (const t of snap.tabs) {
+    const k = key(t.url, t.title);
+    total.set(k, (total.get(k) ?? 0) + 1);
+    (allByKey.get(k) ?? allByKey.set(k, []).get(k)).push(t.tabId);
+    if (inScope(t)) (scoped.get(k) ?? scoped.set(k, []).get(k)).push(t.tabId);
+  }
+  const targets = new Set([...(state.created ?? []).map((c) => c.targetId), ...(state.allowed ?? [])]);
+  const tabIdOf = new Map((state.created ?? []).map((c) => [c.targetId, c.tabId])); // targetId -> tabId
+  const ambiguous = new Set();
+  for (const p of pages) {
+    const k = key(p.url, p.title);
+    const s = scoped.get(k)?.length ?? 0;
+    if (s && s === total.get(k)) targets.add(p.targetId);
+    else if (s) ambiguous.add(p.targetId);
+    if (!tabIdOf.has(p.targetId) && allByKey.get(k)?.length === 1) tabIdOf.set(p.targetId, allByKey.get(k)[0]);
+  }
+  const alive = new Set(targetInfos.map((t) => t.targetId));
+  for (const t of [...targets]) if (!alive.has(t)) targets.delete(t);
+  return { bridge: b, group: g, targets, ambiguous, pages, tabIdOf };
+}
+
+// ---------------------------------------------------------------- state
+
+const statePath = (s) => path.join(STATE_DIR, `${s}.json`);
+function loadState(s) {
+  try {
+    return JSON.parse(fs.readFileSync(statePath(s), "utf8"));
+  } catch {
+    // Without state the session was never created by cb: passing it through
+    // would make agent-browser launch a separate, fresh browser.
+    die(`unknown session '${s}'; create one with 'cb new' (or it already ended with 'done')`);
+  }
+}
+function saveState(st) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.writeFileSync(statePath(st.session), JSON.stringify(st, null, 2));
+}
+
+// ---------------------------------------------------------------- binding
+
+function tabRefFor(session, targetId) {
+  const t = abTabs(session).find((x) => x.targetId === targetId);
+  if (!t) die(`agent-browser does not see target ${targetId}`);
+  return t.tabId;
+}
+
+function bind(session, targetId, { soft = false } = {}) {
+  const r = ab(session, ["--pin-tab", "tab", tabRefFor(session, targetId)]);
+  if (r.code === 0) return true;
+  if (soft && /tab_locked/.test(r.err + r.out)) return false; // pinned by another agent
+  die(`could not bind session to tab: ${(r.err || r.out).trim()}`);
+}
+
+function resolveRef(session, ref) {
+  const tabs = abTabs(session);
+  const t = tabs.find((x) => x.tabId === ref || x.label === ref || x.targetId === ref);
+  if (!t) die(`unknown tab '${ref}' (use '<session> tab list')`);
+  return t;
+}
+
+async function waitTarget(cdp, url, ctx) {
+  for (let i = 0; i < 30; i++) {
+    const { targetInfos } = await cdp.send("Target.getTargets");
+    const t = targetInfos.find((x) => x.type === "page" && x.url === url && x.browserContextId === ctx);
+    if (t) return t.targetId;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  die("created tab did not appear over CDP");
+}
+
+// Opens a new tab in the session's group via the bridge and binds the session to it.
+async function newScopedTab(env, state, scope) {
+  const marker = `about:blank#cb-${randomBytes(6).toString("hex")}`;
+  const r = await scope.bridge.call("createTab", {
+    url: marker,
+    groupId: scope.group ? scope.group.groupId : null,
+    title: state.groupTitle,
+    newWindow: !!state.newWindow,
+  });
+  const targetId = await waitTarget(env.cdp, marker, scope.bridge.ctx);
+  if (state.groupId !== r.groupId) state.groupId = r.groupId;
+  (state.created ??= []).push({ tabId: r.tabId, targetId });
+  saveState(state);
+  bind(state.session, targetId);
+  return targetId;
+}
+
+// ---------------------------------------------------------------- commands
+
+function parseNewArgs(argv) {
+  const o = { profile: null, group: null, own: false, ownTitle: null, sameWindow: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--profile") o.profile = argv[++i];
+    else if (a === "--group") o.group = argv[++i];
+    else if (a === "--same-window") o.sameWindow = true;
+    else if (a === "--own-group") {
+      o.own = true;
+      if (argv[i + 1] && !argv[i + 1].startsWith("--")) o.ownTitle = argv[++i];
+    } else die(`unknown option for new: ${a}`);
+  }
+  if (o.group && o.own) die("use either --group or --own-group, not both");
+  if (o.profile && !o.group) o.own = true;
+  return o;
+}
+
+async function cmdNew(argv) {
+  const o = parseNewArgs(argv);
+  const session = `cb-${new Date().toISOString().replace(/\D/g, "").slice(4, 14)}-${randomBytes(3).toString("hex")}`;
+  const url = cdpUrl();
+
+  if (!o.group && !o.own) {
+    const r = ab(session, ["--pin-tab", "connect", url]);
+    if (r.code !== 0) die(`connect failed: ${(r.err || r.out).trim()}`);
+    saveState({ session, mode: "unscoped" });
+    console.log(session);
+    return;
+  }
+
+  const env = await connectAll();
+  try {
+    if (!env.bridges.length) die("cb-bridge is not reachable in any profile. See 'cb install-bridge'.");
+    const cands = matchProfile(env.bridges, o.profile);
+    const state = { session, mode: o.own ? "own-group" : "group", created: [], allowed: [] };
+    let bridge, group;
+    if (o.group) {
+      const hits = [];
+      for (const b of cands) for (const g of (await b.call("snapshot")).groups) if (g.title === o.group) hits.push({ b, g });
+      if (!hits.length) die(`no tab group titled '${o.group}'${o.profile ? ` in ${o.profile}` : ""}. Run 'cb profiles'.`);
+      if (hits.length > 1)
+        die(`'${o.group}' matches ${hits.length} groups (${hits.map((h) => h.b.profile.name).join(", ")}); add --profile`);
+      ({ b: bridge, g: group } = hits[0]);
+    } else {
+      if (cands.length > 1) die(`several profiles are open (${cands.map((b) => b.profile.name).join(", ")}); add --profile`);
+      bridge = cands[0];
+    }
+    if (!bridge.profile.email) die("that profile is not signed in to Chrome, so cb cannot identify it");
+    Object.assign(state, {
+      profile: bridge.profile,
+      groupId: group?.groupId ?? null,
+      groupTitle: group?.title ?? o.ownTitle ?? `🤖 ${session}`,
+      newWindow: o.own && !o.sameWindow,
+    });
+
+    // attach without --pin-tab (no stray tab), then pin to an in-scope tab
+    const r = ab(session, ["connect", url]);
+    if (r.code !== 0) die(`connect failed: ${(r.err || r.out).trim()}`);
+    saveState(state);
+
+    if (o.own) {
+      await newScopedTab(env, state, { bridge, group: null });
+    } else {
+      const scope = await computeScope(env, state);
+      const snap = await bridge.call("snapshot");
+      const order = snap.tabs.filter((t) => t.groupId === group.groupId).sort((a, b) => b.active - a.active || a.index - b.index);
+      // agent-browser hides chrome:// pages (e.g. a group's New Tab), so only pick tabs it can see
+      const visible = new Set(abTabs(session).map((t) => t.targetId));
+      const cand = order
+        .map((t) =>
+          scope.pages.find(
+            (p) => p.url === t.url && p.title === t.title && scope.targets.has(p.targetId) && visible.has(p.targetId),
+          ),
+        )
+        .filter(Boolean);
+      // skip tabs another agent has pinned; if none is free, work in a fresh tab inside the group
+      let bound = false;
+      for (const p of cand) if ((bound = bind(session, p.targetId, { soft: true }))) break;
+      if (!bound) await newScopedTab(env, state, scope);
+    }
+    console.log(session);
+  } catch (e) {
+    ab(session, ["close"]);
+    fs.rmSync(statePath(session), { force: true });
+    throw e;
+  } finally {
+    env.cdp.close();
+  }
+}
+
+async function cmdProfiles() {
+  const env = await connectAll();
+  try {
+    const seen = new Set();
+    for (const b of env.bridges) {
+      seen.add(b.profile.email);
+      const snap = await b.call("snapshot");
+      console.log(`● ${b.profile.name} <${b.profile.email || "not signed in"}> [${b.profile.dir}] cb-bridge ${b.info.version}`);
+      for (const g of snap.groups) {
+        const n = snap.tabs.filter((t) => t.groupId === g.groupId).length;
+        console.log(`    group "${g.title}" (${g.color}, ${n} tabs)`);
+      }
+      const loose = snap.tabs.filter((t) => t.groupId === -1).length;
+      console.log(`    (${loose} ungrouped tabs)`);
+    }
+    for (const p of env.profiles)
+      if (!seen.has(p.email)) console.log(`○ ${p.name} <${p.email}> [${p.dir}] not open, or cb-bridge not loaded`);
+  } finally {
+    env.cdp.close();
+  }
+}
+
+function cmdInstallBridge() {
+  const d = userDataDir();
+  if (!d.local) die("unset CDP_CHROME_USER_DATA_DIR so cb can locate %LOCALAPPDATA%");
+  const dest = path.join(d.local, "agent-skills", "cb-bridge");
+  fs.mkdirSync(dest, { recursive: true });
+  for (const f of ["manifest.json", "background.js"]) fs.copyFileSync(path.join(BRIDGE_DIR, f), path.join(dest, f));
+  const win = run("wslpath", ["-w", dest]).out.trim();
+  console.log(`copied cb-bridge to ${win}
+In EACH Chrome profile you want to scope to:
+  1. open chrome://extensions and turn on Developer mode
+  2. "Load unpacked" -> ${win}   (after updates: click the reload icon instead)
+Extension id should be ${BRIDGE_ID}. Then check with: cb profiles`);
+}
+
+const BLOCKED = new Set(["--all", "--cdp", "--session", "--no-pin-tab", "--auto-connect", "connect"]);
+
+async function cmdSession(session, argv) {
+  if (!SESSION_RE.test(session)) die(`session name must look like cb-xxxx (got '${session}'); create one with 'cb new'`);
+  if (!argv.length) die("missing agent-browser command");
+  for (const a of argv) if (BLOCKED.has(a)) die(`'${a}' is not allowed via cb (it would escape this session)`);
+  if (argv[0] === "close") die("use 'done' to end the session");
+  const state = loadState(session);
+
+  if (state.mode === "unscoped") {
+    if (argv[0] === "done") {
+      ab(session, ["tab", "close"]);
+      ab(session, ["close"]);
+      fs.rmSync(statePath(session), { force: true });
+      console.log(`cb: session ${session} released`);
+      return;
+    }
+    if (argv[0] === "scope" || argv[0] === "allow") die("this session is unscoped (created without --group/--own-group)");
+    passthrough(session, argv);
+    return;
+  }
+
+  const env = await connectAll();
+  let code = 0;
+  try {
+    const scope = await computeScope(env, state);
+    const [cmd, sub, arg] = argv;
+
+    if (cmd === "done") {
+      const created = (state.created ?? []).filter((c) => scope.pages.some((p) => p.targetId === c.targetId));
+      if (created.length) await scope.bridge.call("closeTabs", created.map((c) => c.tabId));
+      ab(session, ["close"]); // detaches only; user's tabs stay open
+      fs.rmSync(statePath(session), { force: true });
+      console.log(`cb: session ${session} released (closed ${created.length} tab(s) it opened)`);
+      return;
+    }
+    if (cmd === "scope") {
+      console.log(`profile: ${state.profile.name} <${state.profile.email}>`);
+      console.log(`group:   "${state.groupTitle}" ${scope.group ? "" : "(gone)"} mode=${state.mode}`);
+      printTabs(session, scope);
+      return;
+    }
+    if (cmd === "allow") {
+      if (!sub) die("usage: allow <tN>");
+      const t = resolveRef(session, sub);
+      (state.allowed ??= []).push(t.targetId);
+      saveState(state);
+      console.log(`cb: ${sub} (${t.url}) added to scope of ${session}`);
+      return;
+    }
+    if (cmd === "tab") {
+      if (!sub || sub === "list") return printTabs(session, scope);
+      if (sub === "new") {
+        if (!scope.group && state.mode === "group") die(`group "${state.groupTitle}" no longer exists`);
+        await newScopedTab(env, state, scope);
+        if (arg) code = passthrough(session, ["open", arg], false);
+        else console.log("cb: opened a new tab in scope");
+        return;
+      }
+      if (sub === "close") {
+        const t = arg ? resolveRef(session, arg) : abTabs(session).find((x) => x.active);
+        const c = (state.created ?? []).find((x) => x.targetId === t?.targetId);
+        if (!c) die("cb only closes tabs it opened itself; ask the user to close other tabs");
+        await scope.bridge.call("closeTabs", [c.tabId]);
+        state.created = state.created.filter((x) => x !== c);
+        saveState(state);
+        const next = await computeScope(env, state);
+        const rest = [...next.targets];
+        if (t.active && rest.length) bind(session, rest[rest.length - 1]);
+        console.log(`cb: closed ${t.tabId}${t.active && !rest.length ? "; no tab left in scope, use 'tab new'" : ""}`);
+        return;
+      }
+      if (sub && !sub.startsWith("-")) {
+        const t = resolveRef(session, sub);
+        if (scope.ambiguous.has(t.targetId))
+          die(`${sub} has the same URL and title as a tab outside the scope; cb cannot tell them apart. Ask the user to close the duplicate.`);
+        if (!scope.targets.has(t.targetId)) die(`${sub} is outside this session's scope ("${state.groupTitle}")`);
+        bind(session, t.targetId);
+        console.log(`cb: switched to ${sub} - ${t.url}`);
+        return;
+      }
+    }
+
+    const active = abTabs(session).find((x) => x.active);
+    if (active && scope.ambiguous.has(active.targetId))
+      die(
+        `the session's current tab (${active.tabId}) has the same URL and title as a tab outside "${state.groupTitle}",\n` +
+          "so cb cannot confirm it is in scope. Ask the user to close the duplicate, or use another in-scope tab.",
+      );
+    if (!active || !scope.targets.has(active.targetId))
+      die(
+        `the session's current tab is outside its scope ("${state.groupTitle}") or gone.\n` +
+          "Use 'tab list' and 'tab <tN>' to pick an in-scope tab, or 'tab new <url>'.",
+      );
+    if (!READ_ONLY.has(cmd)) await activate(env, scope, active.targetId);
+    code = passthrough(session, argv, false);
+  } finally {
+    env.cdp.close();
+  }
+  process.exitCode = code;
+}
+
+// Commands that work fine on a hidden tab; everything else (click, fill, type,
+// press, scroll, screenshot, ...) needs the tab to be visible in its window.
+const READ_ONLY = new Set(["get", "is", "snapshot", "read", "cookies", "storage", "console", "errors", "network", "session", "scope"]);
+
+async function activate(env, scope, targetId) {
+  const tabId = scope.tabIdOf.get(targetId);
+  if (tabId !== undefined) await scope.bridge.call("activateTab", tabId);
+  else await env.cdp.send("Target.activateTarget", { targetId }); // fallback; may raise the window
+  await new Promise((r) => setTimeout(r, 150));
+}
+
+function printTabs(session, scope) {
+  for (const t of abTabs(session)) {
+    if (!scope.targets.has(t.targetId) && !scope.ambiguous.has(t.targetId)) continue;
+    const mark = t.active ? "→" : " ";
+    const amb = scope.ambiguous.has(t.targetId) ? " (ambiguous: duplicate outside scope)" : "";
+    console.log(`${mark} [${t.tabId}] ${t.title} - ${t.url}${amb}`);
+  }
+}
+
+function passthrough(session, argv, exit = true) {
+  const r = spawnSync("timeout", [String(TIMEOUT_S), "agent-browser", "--session", session, ...argv], { stdio: "inherit" });
+  if (exit) process.exit(r.status ?? 1);
+  return r.status ?? 1;
+}
+
+// ---------------------------------------------------------------- main
+
+const [first, ...rest] = process.argv.slice(2);
+try {
+  if (!first || first === "-h" || first === "--help") {
+    const src = fs.readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n");
+    console.log(src.slice(1, src.findIndex((l) => l.startsWith("import"))).map((l) => l.replace(/^\/\/ ?/, "")).join("\n").trim());
+  } else if (first === "new") await cmdNew(rest);
+  else if (first === "profiles" || first === "groups") await cmdProfiles();
+  else if (first === "install-bridge") cmdInstallBridge();
+  else await cmdSession(first, rest);
+} catch (e) {
+  if (!(e instanceof CbError)) throw e;
+  console.error(`cb: ${e.message}`);
+  process.exitCode = 1;
+}
+process.exit(process.exitCode ?? 0);

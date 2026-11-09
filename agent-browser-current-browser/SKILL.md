@@ -1,6 +1,6 @@
 ---
 name: agent-browser-current-browser
-description: Connect agent-browser via CDP to the user's already-open Windows Chrome/Edge (not a fresh/headless instance) from inside WSL2, without restarting the browser or closing its tabs. Use whenever the user asks to read, click, or automate something in "the browser I already have open" / "現在のブラウザ" / "既存のブラウザ" (e.g. check Google Calendar, read a page they're logged into) rather than a brand-new agent-browser session.
+description: Connect agent-browser via CDP to the user's already-open Windows Chrome/Edge (not a fresh/headless instance) from inside WSL2, without restarting the browser or closing its tabs. Use whenever the user asks to read, click, or automate something in "the browser I already have open" / "現在のブラウザ" / "既存のブラウザ" (e.g. check Google Calendar, read a page they're logged into) rather than a brand-new agent-browser session. Also use it when the user names a Chrome profile or tab group to work in (e.g. "Work の『調査』グループで"), or when several agents use the browser concurrently.
 ---
 
 # agent-browser: connect to the current Windows browser via CDP (WSL2)
@@ -105,6 +105,76 @@ Rules:
 - `[agent-browser] launched browser` on `cb new` refers to the session daemon;
   it is attached to the real Chrome (confirm with `tab list` showing the
   user's tabs).
+
+## Scoping to a Chrome profile and tab group
+
+The user keeps several Chrome profiles (e.g. Work, Personal) in one
+browser, and groups tabs by task. A session can be confined to **one profile
+and one tab group**. Prefer this whenever the user names a profile or group
+("Work の『調査』グループで…").
+
+```bash
+$CB profiles                                    # profiles, cb-bridge status, tab groups
+$CB new --group "調査" --profile Work            # main use: work in the user's existing group
+$CB new --own-group --profile Work               # agent gets its own group "🤖 cb-…" in a new window
+$CB new --own-group "資料確認" --profile Work --same-window   # own group, in the user's window
+```
+
+- `--profile` accepts the Chrome profile name (`Work`), the signed-in email,
+  or just its domain (`example.com`). Without `--profile`, `--group` searches all
+  profiles and errors if the title is ambiguous. `--profile` alone implies
+  `--own-group`. Titles must match exactly; on a miss, run `cb profiles` and
+  show the user the real group names instead of guessing.
+- In scope = tabs in the group, tabs cb opened for the session, and
+  popups/tabs opened *from* an in-scope tab (e.g. OAuth popup windows, which
+  can't be grouped). `tab list` shows only these; `tab <tN>` to anything
+  else fails, and so does any command while the session's tab has left the
+  scope (e.g. the user dragged it out of the group).
+- **Leaving the scope**: if the task truly needs a tab outside it, ask the
+  user. Only after they explicitly agree, run `$CB <name> allow <tN>` (get
+  `tN` from bare `agent-browser --session <name> tab list`). Never use
+  `allow` on your own initiative.
+- `tab new [url]` creates the tab inside the group. `tab close` and `done`
+  only close tabs cb opened; the user's own tabs in the group are never
+  closed (ask the user if something should be closed). In an existing
+  group, prefer `tab new <url>` over `open <url>` unless the user wants
+  you to navigate one of their tabs.
+- Hidden (background) tabs don't receive clicks/keys. Before input commands
+  (anything except `get`/`is`/`snapshot`/`read`/…), cb makes the session's
+  tab the active tab of its window (no window focus/raise). So in the
+  user's window, the visible tab will switch while you work. Two agents doing
+  input in the **same window** take turns being visible; for real parallel
+  input give each agent its own window (`--own-group` default, or have the
+  user put each group in its own window).
+- If the same URL+title is open both inside and outside the group, cb can't
+  tell which tab is which (it doesn't have the `debugger` permission) and
+  refuses to act on it ("ambiguous"). Ask the user to close the duplicate.
+- Tabs on `chrome://` pages (e.g. an empty New Tab in the group) are
+  invisible to agent-browser; if the group only has those, cb works in a
+  fresh tab inside the group.
+- This is a guardrail against mistakes, not a security boundary: the CDP
+  connection itself can control the whole browser.
+
+### cb-bridge extension (one-time setup per profile)
+
+CDP doesn't expose profile names or tab groups, so scoping uses the small
+companion extension in `cb-bridge/` (MV3; permissions `tabs`, `tabGroups`,
+`storage`, `identity`, `identity.email`; no content scripts, no host
+permissions, no network). `cb` calls it over CDP. See `cb-bridge/README.md`.
+
+1. `$CB install-bridge` copies it to `%LOCALAPPDATA%\agent-skills\cb-bridge`.
+2. The **user** loads it once in each profile: `chrome://extensions` →
+   Developer mode → "Load unpacked" → that folder (id
+   `haagbfgnipgidagcllndobiiiejdnpjl`). After updating the extension, rerun
+   step 1 and have the user click its reload icon; cb refuses outdated
+   versions.
+3. `$CB profiles` should show `●` for that profile. `○` means the profile is
+   not open or the extension isn't loaded there; the profile must be signed
+   in to Chrome (identified by email against `Local State`).
+
+Managed (Google Workspace) profiles may block Developer mode or unpacked
+extensions by policy; then scoping isn't available there — fall back to
+unscoped `cb new` and tell the user.
 
 ## Known gotchas
 
