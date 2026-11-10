@@ -243,6 +243,23 @@ Managed (Google Workspace) profiles may block Developer mode or unpacked
 extensions by policy; then scoping isn't available there — `cb new` falls
 back to an ungrouped tab by itself (or use `cb new --no-group`); tell the user.
 
+## Slack links open in the browser, not the desktop app
+
+Slack permalinks (`https://<ws>.slack.com/archives/C…/p…?thread_ts=…`) normally
+hand off to the desktop app via `slack://`. `cb <name> open|goto|navigate <url>`
+and `cb <name> tab new <url>` rewrite them automatically to the web client,
+`https://app.slack.com/client/<team>/<channel>[/thread/<channel>-<thread_ts>]`,
+so just pass the permalink as is.
+
+- The team id is read once from the web client's `localStorage.localConfig_v2`
+  in the session's tab (cb briefly opens `https://app.slack.com/client`) and
+  cached in `~/.cache/cb/slack-teams.json` (workspace host → `T…`/`E…`).
+  Delete that file if a workspace is added or ids look wrong.
+- If the profile isn't signed in to that workspace, cb warns and opens the
+  permalink unchanged.
+- A reply permalink opens its thread pane (Slack's web URL can't highlight a
+  single reply); a channel link opens the channel.
+
 ## Known gotchas
 
 - **Chrome's HTTP discovery endpoints (`/json`, `/json/version`, `/json/list`)

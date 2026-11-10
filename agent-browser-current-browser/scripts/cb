@@ -21,6 +21,9 @@
 //   cb <session> show                        bring the session's tab to the front (only when asked)
 //   cb <session> done [--close]              detach the session; tabs stay open unless --close
 //
+// Slack permalinks given to open/goto/navigate/tab new are rewritten to the web
+// client (app.slack.com/client/…) so they don't hand off to the desktop app.
+//
 // Everything runs in background tabs: cb never activates a tab or window on its
 // own (that steals focus and flashes the Windows taskbar).
 //
@@ -857,7 +860,82 @@ function printTabs(session, scope) {
   }
 }
 
+// ---------------------------------------------------------------- Slack links
+
+// Slack permalinks (https://<ws>.slack.com/archives/C…/p…) land on a page that
+// hands off to the desktop app via slack://, which pops a Windows dialog/the app
+// instead of showing the message. The web client takes
+//   https://app.slack.com/client/<team>/<channel>[/thread/<channel>-<thread_ts>]
+// directly and stays in the browser. The team id comes from the web client's own
+// localStorage (localConfig_v2), read in the session's tab and cached.
+const SLACK_TEAMS = path.join(CACHE_DIR, "slack-teams.json");
+const SLACK_PERMALINK = /^https:\/\/([a-z0-9-]+(?:\.enterprise)?)\.slack\.com\/archives\/([A-Z0-9]+)(?:\/p(\d{10})(\d{6}))?\/?(?:[?#]|$)/i;
+const OPEN_CMDS = new Set(["open", "goto", "navigate"]);
+
+function readSlackTeams() {
+  try {
+    return JSON.parse(fs.readFileSync(SLACK_TEAMS, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function slackTeamId(session, host) {
+  const cached = readSlackTeams()[host];
+  if (cached) return cached;
+  // app.slack.com/client opens the last used workspace in the browser (no app hand-off)
+  const o = ab(session, ["open", "https://app.slack.com/client"], { timeout: Math.max(TIMEOUT_S, 40) });
+  if (o.code !== 0) return null;
+  const expr =
+    "JSON.stringify(Object.values(JSON.parse(localStorage.localConfig_v2||'{}').teams||{}).map(t=>[t.url,t.id]))";
+  let pairs = [];
+  for (let i = 0; i < 10 && !pairs.length; i++) {
+    const r = ab(session, ["eval", expr, "--json"]);
+    try {
+      pairs = JSON.parse(JSON.parse(r.out).data.result);
+    } catch {}
+    if (!pairs.length) sleepSync(1000);
+  }
+  const teams = readSlackTeams();
+  for (const [url, id] of pairs) {
+    try {
+      if (id) teams[new URL(url).hostname] = id;
+    } catch {}
+  }
+  fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(SLACK_TEAMS, JSON.stringify(teams, null, 2), { mode: 0o600 });
+  return teams[host] ?? null;
+}
+
+// Returns the web-client URL for a Slack permalink, or the input unchanged.
+function slackWebUrl(session, url) {
+  const m = SLACK_PERMALINK.exec(url ?? "");
+  if (!m) return url;
+  const host = `${m[1].toLowerCase()}.slack.com`;
+  const [, , channel, sec, usec] = m;
+  const team = slackTeamId(session, host);
+  if (!team) {
+    console.error(`cb: no Slack team id for ${host} (not signed in to it in this profile?); opening the permalink as is`);
+    return url;
+  }
+  const q = new URL(url).searchParams;
+  const threadTs = q.get("thread_ts") ?? (sec ? `${sec}.${usec}` : null);
+  const out = `https://app.slack.com/client/${team}/${q.get("cid") ?? channel}${threadTs ? `/thread/${q.get("cid") ?? channel}-${threadTs}` : ""}`;
+  console.error(`cb: Slack permalink -> ${out} (web client, not the desktop app)`);
+  return out;
+}
+
+// Rewrites the URL argument of open/goto/navigate when it is a Slack permalink.
+function rewriteOpen(session, argv) {
+  if (!OPEN_CMDS.has(argv[0])) return argv;
+  const i = argv.findIndex((a, k) => k > 0 && !a.startsWith("-"));
+  if (i < 0) return argv;
+  const url = slackWebUrl(session, argv[i]);
+  return url === argv[i] ? argv : argv.with(i, url);
+}
+
 function passthrough(session, argv, exit = true) {
+  argv = rewriteOpen(session, argv);
   const r = spawnSync("timeout", [String(TIMEOUT_S), "agent-browser", "--session", session, ...argv], { stdio: "inherit" });
   if (exit) process.exit(r.status ?? 1);
   return r.status ?? 1;
