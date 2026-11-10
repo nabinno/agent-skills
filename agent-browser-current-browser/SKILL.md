@@ -76,11 +76,24 @@ The wrapper `scripts/cb` (next to this file) does this for you:
 ```bash
 CB=~/.ghq.d/src/github.com/nabinno/agent-skills/agent-browser-current-browser/scripts/cb
 $CB new                                   # -> prints e.g. cb-1109233337-daed4a; opens a pinned background tab
+                                          #    in its own tab group "🤖 cb-1109233337-daed4a"
 $CB cb-1109233337-daed4a open "https://example.com"
 $CB cb-1109233337-daed4a snapshot -i -c
 $CB cb-1109233337-daed4a click @e3
-$CB cb-1109233337-daed4a done             # close ONLY this session's tab and detach
+$CB cb-1109233337-daed4a done             # detach; the tabs stay open for the user to review
 ```
+
+Defaults:
+- **`cb new` works in its own tab group.** With no options it creates a new
+  group "🤖 cb-…" in the **last active profile** (the profile a plain new
+  tab would open in), same as `--own-group`. Give it a task name when one is
+  obvious: `cb new --own-group "資料確認"`. If cb-bridge isn't loaded in that
+  profile (or nowhere), it falls back to an ungrouped tab and says so on
+  stderr. `cb new --no-group` asks for an ungrouped tab explicitly.
+- **`done` does not close tabs.** It only detaches the session; the tabs it
+  opened stay open (in their group) so the user can review the work. Tell
+  the user which group/tabs are left open. `done --close` closes the tabs cb
+  opened — use it only when the user asks for cleanup.
 
 Rules:
 - Run `cb new` **once per task** and reuse the printed name **literally** in
@@ -90,13 +103,16 @@ Rules:
   would collide on the same name.
 - If you spawn subagents that use the browser, have each run its own
   `cb new`; never hand one session name to two concurrent workers.
-- Stay in your pinned tab. Use `open <url>` to navigate it. Only use
-  `tab new` if you really need a second tab, and close it yourself.
+- Stay in your pinned tab. Use `open <url>` to navigate it. Use `tab new`
+  only if you really need a second tab; leave it open at the end like the
+  others (close it with `tab close` only if it's clearly throwaway, e.g. a
+  failed load, or the user asks).
   `tab list` shows the user's/other agents' tabs too — read-only info, don't
   switch into them unless the user asked you to work in a specific existing tab.
 - If a command returns `tab_gone` (the user closed your tab), recover with
   `$CB <name> tab new <url>`; don't fall back to another tab.
-- Always finish with `$CB <name> done`. Never run `agent-browser close --all`
+- Always finish with `$CB <name> done` (tabs stay open; no `--close` unless
+  the user asks). Never run `agent-browser close --all`
   (cb refuses `--all`), and never use the `default` session.
 - `cb` already wraps each call in `timeout` (`CB_TIMEOUT`, default 25s);
   raise it for slow pages, e.g. `CB_TIMEOUT=60 $CB <name> wait --load networkidle`.
@@ -165,7 +181,8 @@ and one tab group**. Prefer this whenever the user names a profile or group
 ```bash
 $CB profiles                                    # profiles, cb-bridge status, tab groups
 $CB new --group "調査" --profile Work            # main use: work in the user's existing group
-$CB new --own-group --profile Work               # agent gets its own group "🤖 cb-…" (background tab)
+$CB new                                         # default: own group "🤖 cb-…" in the last active profile
+$CB new --own-group --profile Work               # own group in a specific profile (background tab)
 $CB new --own-group "資料確認" --profile Work --new-window    # own group in a separate window
 ```
 
@@ -183,9 +200,10 @@ $CB new --own-group "資料確認" --profile Work --new-window    # own group in
   user. Only after they explicitly agree, run `$CB <name> allow <tN>` (get
   `tN` from bare `agent-browser --session <name> tab list`). Never use
   `allow` on your own initiative.
-- `tab new [url]` creates the tab inside the group. `tab close` and `done`
-  only close tabs cb opened; the user's own tabs in the group are never
-  closed (ask the user if something should be closed). In an existing
+- `tab new [url]` creates the tab inside the group. `tab close` and
+  `done --close` only close tabs cb opened; the user's own tabs in the group
+  are never closed (ask the user if something should be closed). Plain
+  `done` closes nothing. In an existing
   group, prefer `tab new <url>` over `open <url>` unless the user wants
   you to navigate one of their tabs.
 - An own group goes into the profile's last used window as a background
@@ -222,8 +240,8 @@ permissions, no network). `cb` calls it over CDP. See `cb-bridge/README.md`.
    in to Chrome (identified by email against `Local State`).
 
 Managed (Google Workspace) profiles may block Developer mode or unpacked
-extensions by policy; then scoping isn't available there — fall back to
-unscoped `cb new` and tell the user.
+extensions by policy; then scoping isn't available there — `cb new` falls
+back to an ungrouped tab by itself (or use `cb new --no-group`); tell the user.
 
 ## Known gotchas
 

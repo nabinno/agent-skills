@@ -3,7 +3,9 @@
 // isolated, tab-pinned session, optionally scoped to a Chrome profile and a
 // tab group, so several agents can work concurrently without colliding.
 //
-//   cb new                                   unscoped: fresh pinned tab (last active profile)
+//   cb new                                   default: a new group "🤖 cb-…" in the last active
+//                                            profile (ungrouped tab if cb-bridge isn't there)
+//   cb new --no-group                        unscoped: fresh pinned tab without a group
 //   cb new --group "調査" [--profile Work]    scope = an existing tab group (main use)
 //   cb new --own-group [TITLE] [--profile Work] [--new-window]
 //                                            scope = a new group created for this agent
@@ -17,7 +19,7 @@
 //   cb <session> scope                       show the session's scope
 //   cb <session> allow <tN>                  add an out-of-scope tab (only on the user's say-so)
 //   cb <session> show                        bring the session's tab to the front (only when asked)
-//   cb <session> done                        close tabs cb opened, detach the session
+//   cb <session> done [--close]              detach the session; tabs stay open unless --close
 //
 // Everything runs in background tabs: cb never activates a tab or window on its
 // own (that steals focus and flashes the Windows taskbar).
@@ -466,6 +468,18 @@ async function newBackgroundTarget(state, url = "about:blank") {
   }
 }
 
+// browserContextId of the profile a plain CDP Target.createTarget lands in (the
+// last active one). CDP can't tell otherwise, so open and close a background probe tab.
+async function lastActiveContext(cdp) {
+  const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank", background: true });
+  try {
+    const { targetInfo } = await cdp.send("Target.getTargetInfo", { targetId });
+    return targetInfo.browserContextId;
+  } finally {
+    await cdp.send("Target.closeTarget", { targetId }).catch(() => {});
+  }
+}
+
 function resolveRef(session, ref) {
   const tabs = abTabs(session);
   const t = tabs.find((x) => x.tabId === ref || x.label === ref || x.targetId === ref);
@@ -503,10 +517,11 @@ async function newScopedTab(env, state, scope) {
 // ---------------------------------------------------------------- commands
 
 function parseNewArgs(argv) {
-  const o = { profile: null, group: null, own: false, ownTitle: null, newWindow: false };
+  const o = { profile: null, group: null, own: false, ownTitle: null, newWindow: false, noGroup: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--profile") o.profile = argv[++i];
+    else if (a === "--no-group") o.noGroup = true;
     else if (a === "--group") o.group = argv[++i];
     else if (a === "--new-window") o.newWindow = true;
     else if (a === "--own-group") {
@@ -515,7 +530,12 @@ function parseNewArgs(argv) {
     } else die(`unknown option for new: ${a}`);
   }
   if (o.group && o.own) die("use either --group or --own-group, not both");
+  if (o.noGroup && (o.group || o.own || o.profile || o.newWindow))
+    die("--no-group cannot be combined with --group/--own-group/--profile/--new-window");
   if (o.profile && !o.group) o.own = true;
+  // default (no options): an own group in the last active profile, if cb-bridge is there
+  o.auto = !o.noGroup && !o.group && !o.own;
+  if (o.auto) o.own = true;
   return o;
 }
 
@@ -524,7 +544,7 @@ async function cmdNew(argv) {
   const session = `cb-${new Date().toISOString().replace(/\D/g, "").slice(4, 14)}-${randomBytes(3).toString("hex")}`;
   cdpUrl();
 
-  if (!o.group && !o.own) {
+  const unscoped = async (note) => {
     const state = { session, mode: "unscoped", created: [] };
     saveState(state);
     try {
@@ -534,14 +554,26 @@ async function cmdNew(argv) {
       fs.rmSync(statePath(session), { force: true });
       throw e;
     }
+    if (note) console.error(`cb: ${note}`);
     console.log(session);
-    return;
-  }
+  };
+  if (o.noGroup) return unscoped();
 
   const env = await connectAll();
   try {
-    if (!env.bridges.length) die("cb-bridge is not reachable in any profile. See 'cb install-bridge'.");
-    const cands = matchProfile(env.bridges, o.profile);
+    if (!env.bridges.length) {
+      if (o.auto) return await unscoped("cb-bridge is not reachable in any profile, so this session works in an ungrouped tab");
+      die("cb-bridge is not reachable in any profile. See 'cb install-bridge'.");
+    }
+    let cands = matchProfile(env.bridges, o.profile);
+    if (o.auto && cands.length > 1) {
+      // Pick the profile a plain CDP tab would land in (the last active one), as unscoped sessions did.
+      const ctx = await lastActiveContext(env.cdp);
+      const hit = cands.filter((b) => b.ctx === ctx);
+      if (!hit.length)
+        return await unscoped("cb-bridge is not loaded in the last active profile, so this session works in an ungrouped tab");
+      cands = hit;
+    }
     const state = { session, mode: o.own ? "own-group" : "group", created: [], allowed: [] };
     let bridge, group;
     if (o.group) {
@@ -628,6 +660,18 @@ In EACH Chrome profile you want to scope to:
 Extension id should be ${BRIDGE_ID}. Then check with: cb profiles`);
 }
 
+// `done` keeps the session's tabs open (the user reviews them afterwards);
+// `done --close` closes the tabs cb opened. The user's own tabs are never closed.
+function doneCloses(argv) {
+  for (const a of argv.slice(1)) if (a !== "--close") die(`unknown option for done: ${a} (only --close)`);
+  return argv.includes("--close");
+}
+
+function releaseState(session) {
+  fs.rmSync(statePath(session), { force: true });
+  fs.rmSync(path.join(socketDir(), `${session}.target`), { force: true });
+}
+
 const BLOCKED = new Set(["--all", "--cdp", "--session", "--no-pin-tab", "--auto-connect", "connect"]);
 
 async function cmdSession(session, argv) {
@@ -639,19 +683,21 @@ async function cmdSession(session, argv) {
 
   if (state.mode === "unscoped") {
     if (argv[0] === "done") {
+      const close = doneCloses(argv);
       ab(session, ["close"]); // detach first, then close the tabs cb opened (no tab switching)
-      const cdp = await Cdp.open(cdpUrl());
-      try {
-        for (const c of state.created ?? []) await cdp.send("Target.closeTarget", { targetId: c.targetId }).catch(() => {});
-      } finally {
-        cdp.close();
+      if (close) {
+        const cdp = await Cdp.open(cdpUrl());
+        try {
+          for (const c of state.created ?? []) await cdp.send("Target.closeTarget", { targetId: c.targetId }).catch(() => {});
+        } finally {
+          cdp.close();
+        }
       }
-      fs.rmSync(statePath(session), { force: true });
-      fs.rmSync(path.join(socketDir(), `${session}.target`), { force: true });
-      console.log(`cb: session ${session} released`);
+      releaseState(session);
+      console.log(`cb: session ${session} released (${close ? "closed the tabs it opened" : "its tabs stay open"})`);
       return;
     }
-    if (argv[0] === "scope" || argv[0] === "allow") die("this session is unscoped (created without --group/--own-group)");
+    if (argv[0] === "scope" || argv[0] === "allow") die("this session is unscoped (created with --no-group, or where cb-bridge was unavailable)");
     const [cmd, sub, arg] = argv;
     if (cmd === "show") return showTab(session, null);
     if (cmd === "tab" && sub === "new") {
@@ -678,12 +724,14 @@ async function cmdSession(session, argv) {
     const [cmd, sub, arg] = argv;
 
     if (cmd === "done") {
-      const created = (state.created ?? []).filter((c) => scope.pages.some((p) => p.targetId === c.targetId));
+      const close = doneCloses(argv);
+      const created = close ? (state.created ?? []).filter((c) => scope.pages.some((p) => p.targetId === c.targetId)) : [];
       if (created.length) await scope.bridge.call("closeTabs", created.map((c) => c.tabId));
       ab(session, ["close"]); // detaches only; user's tabs stay open
-      fs.rmSync(statePath(session), { force: true });
-      fs.rmSync(path.join(socketDir(), `${session}.target`), { force: true });
-      console.log(`cb: session ${session} released (closed ${created.length} tab(s) it opened)`);
+      releaseState(session);
+      console.log(
+        `cb: session ${session} released (${close ? `closed ${created.length} tab(s) it opened` : `its tabs stay open in "${state.groupTitle}"`})`,
+      );
       return;
     }
     if (cmd === "show") return showTab(session, scope);
