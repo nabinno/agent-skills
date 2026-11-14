@@ -1,8 +1,9 @@
 # agent-skills
 
 Shared [SKILL.md](https://github.com/anthropics/skills) skills, reused across
-Claude Code, Codex, and Grok CLIs — all three load the same `<name>/SKILL.md`
-format, so one skill here works everywhere via symlinks instead of copies.
+Claude Code, Codex, Grok, and Antigravity CLIs — all load the same
+`<name>/SKILL.md` format, so one skill here works everywhere via symlinks
+instead of copies.
 
 ## Layout
 
@@ -27,6 +28,8 @@ This symlinks every skill here into:
 - `~/.claude/skills/<name>` (Claude Code — or `$CLAUDE_HOME` / `$CLAUDE_CONFIG_DIR` if set)
 - `~/.codex/skills/<name>` (Codex — leaves the reserved `.system/` subdir alone)
 - `~/.grok/skills/<name>` (Grok)
+- `~/.gemini/config/skills/<name>` (Antigravity global skills — or `$GEMINI_CONFIG_DIR` if set)
+- `~/.agents/skills/<name>` (shared `.agents` workspace skills — or `$AGENTS_HOME` if set)
 
 Re-run `scripts/sync.sh` after adding a new skill directory. It's idempotent
 and never overwrites a real (non-symlink) directory that happens to already
