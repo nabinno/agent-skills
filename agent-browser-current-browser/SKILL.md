@@ -43,8 +43,10 @@ and the user agrees to a fallback.
 
 ## Discovering and connecting
 
-A ready-made helper already exists in the user's dotfiles:
-`~/.ghq.d/src/github.com/nabinno/dotfiles/.local/bin/cdp` (Python 3). It:
+A ready-made helper ships next to `scripts/cb`:
+`agent-browser-current-browser/scripts/cdp` (Python 3). `cb` calls that
+file. Link it to `~/.local/bin/cdp` if you want the `cdp` command on
+`PATH`. It:
 - Reads `DevToolsActivePort` from the Windows Chrome profile directory
   (resolved via `$CDP_CHROME_USER_DATA_DIR`, `$USER_PROFILE`, or by asking
   Windows for `$env:LOCALAPPDATA` through `powershell.exe` interop and
