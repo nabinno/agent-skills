@@ -11,6 +11,7 @@ Each top-level directory is one skill:
 
 ```
 <skill-name>/
+  README.md       # what it does and how to run it
   SKILL.md        # required: frontmatter (name, description) + instructions
   scripts/        # optional helper scripts
   references/     # optional extra docs loaded on demand
@@ -41,6 +42,12 @@ exist with the same name.
    existing skill here for the frontmatter format).
 2. `scripts/sync.sh`
 3. Commit and push.
+
+## Skills
+
+- [agent-browser-current-browser](agent-browser-current-browser/README.md) — drive the Chrome or Edge window already open on Windows, from WSL2.
+- [herdr-reorder-tabs](herdr-reorder-tabs/README.md) — reorder tabs in the Herdr session this agent is running in.
+- [wsl-clipboard-bridge](wsl-clipboard-bridge/README.md) — copy and paste between WSL2 and the Windows clipboard, including Japanese text.
 
 ## License
 
