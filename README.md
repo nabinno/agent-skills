@@ -41,3 +41,7 @@ exist with the same name.
    existing skill here for the frontmatter format).
 2. `scripts/sync.sh`
 3. Commit and push.
+
+## License
+
+[MIT](LICENSE)
