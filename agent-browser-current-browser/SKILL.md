@@ -1,18 +1,25 @@
 ---
 name: agent-browser-current-browser
-description: Connect agent-browser via CDP to the user's already-open Windows Chrome/Edge (not a fresh/headless instance) from inside WSL2, without restarting the browser or closing its tabs. Use whenever the user asks to read, click, or automate something in "the browser I already have open" / "現在のブラウザ" / "既存のブラウザ" (e.g. check Google Calendar, read a page they're logged into) rather than a brand-new agent-browser session. Also use it when the user names a Chrome profile or tab group to work in (e.g. "Work の『調査』グループで"), or when several agents use the browser concurrently.
+description: Connect agent-browser via CDP to the user's already-open Chrome/Edge (not a fresh/headless instance), without restarting the browser or closing its tabs. Use whenever the user asks to read, click, or automate something in "the browser I already have open" / "現在のブラウザ" / "既存のブラウザ" (e.g. check Google Calendar, read a page they're logged into) rather than a brand-new agent-browser session. Also use it when the user names a Chrome profile or tab group to work in (e.g. "Work の『調査』グループで"), or when several agents use the browser concurrently. The same scripts run on macOS, in Windows PowerShell, and inside WSL2 (WSL2 still needs mirrored networking).
 ---
 
-# agent-browser: connect to the current Windows browser via CDP (WSL2)
+# agent-browser: connect to the current Chrome via CDP
 
-Goal: drive the user's real, already-open Chrome/Edge window from WSL2 using
-agent-browser, so their existing tabs/login state are reused. Do NOT restart
-their browser or launch a separate agent-browser profile unless this fails
-and the user agrees to a fallback.
+Goal: drive the user's real, already-open Chrome/Edge window using
+agent-browser, so their existing tabs/login state are reused. The same
+`scripts/cb` runs on macOS, in Windows PowerShell, and inside WSL2.
+`scripts/platform.mjs` is the only host branch (Chrome's directory, process
+checks, command timeout, extension copy path). Do NOT restart their browser
+or launch a separate agent-browser profile unless this fails and the user
+agrees to a fallback.
 
 ## Prerequisites (one-time, already done on this machine)
 
-1. **WSL2 mirrored networking** must be enabled, or `127.0.0.1` inside WSL2
+On macOS and in Windows PowerShell, Chrome and the shell share loopback, so
+mirrored networking does not apply. On Windows, start cb with `scripts/cb.cmd`
+or `node scripts/cb` (`#!` is not used by PowerShell).
+
+1. **WSL2 only: mirrored networking** must be enabled, or `127.0.0.1` inside WSL2
    and on Windows are different network namespaces and the browser's CDP
    port is unreachable.
    - Config file: `C:\Users\<you>\.wslconfig`
@@ -44,13 +51,16 @@ and the user agrees to a fallback.
 ## Discovering and connecting
 
 A ready-made helper ships next to `scripts/cb`:
-`agent-browser-current-browser/scripts/cdp` (Python 3). `cb` calls that
-file. Link it to `~/.local/bin/cdp` if you want the `cdp` command on
-`PATH`. It:
-- Reads `DevToolsActivePort` from the Windows Chrome profile directory
-  (resolved via `$CDP_CHROME_USER_DATA_DIR`, `$USER_PROFILE`, or by asking
-  Windows for `$env:LOCALAPPDATA` through `powershell.exe` interop and
-  converting with `wslpath`).
+`scripts/cdp` prints the WebSocket URL. `cb` uses the same code in
+`scripts/platform.mjs` and does not spawn `cdp`. Link `cdp` to
+`~/.local/bin/cdp` if you want the command on `PATH`. On Windows the launcher
+is `scripts/cdp.cmd`. It:
+- Reads `DevToolsActivePort` from the Chrome user-data directory for this host.
+  macOS: `~/Library/Application Support/Google/Chrome`.
+  Windows PowerShell: `%LOCALAPPDATA%\Google\Chrome\User Data`.
+  WSL: `$USER_PROFILE/AppData/Local/Google/Chrome/User Data` when that path
+  exists, otherwise `%LOCALAPPDATA%` via `powershell.exe` and `wslpath`.
+  `$CDP_CHROME_USER_DATA_DIR` overrides all three.
 - Builds `ws://127.0.0.1:<port>/devtools/browser/<uuid>` from that file.
 - `cdp --url` prints the discovered WebSocket URL.
 - `cdp --check` does a raw TCP reachability check only.
@@ -116,7 +126,7 @@ Rules:
 - Always finish with `$CB <name> done` (tabs stay open; no `--close` unless
   the user asks). Never run `agent-browser close --all`
   (cb refuses `--all`), and never use the `default` session.
-- `cb` already wraps each call in `timeout` (`CB_TIMEOUT`, default 25s);
+- `cb` already bounds each call with Node's spawn timeout (`CB_TIMEOUT`, default 25s);
   raise it for slow pages, e.g. `CB_TIMEOUT=60 $CB <name> wait --load networkidle`.
 - Cookies/login state are shared (same Chrome profile), so concurrent agents
   logging in/out of the same site can still affect each other — avoid
@@ -231,7 +241,9 @@ companion extension in `cb-bridge/` (MV3; permissions `tabs`, `tabGroups`,
 `storage`, `identity`, `identity.email`; no content scripts, no host
 permissions, no network). `cb` calls it over CDP. See `cb-bridge/README.md`.
 
-1. `$CB install-bridge` copies it to `%LOCALAPPDATA%\agent-skills\cb-bridge`.
+1. `$CB install-bridge` copies it to the host bridge directory and prints that
+   path. Windows, including from WSL: `%LOCALAPPDATA%\agent-skills\cb-bridge`.
+   macOS: `~/Library/Application Support/agent-skills/cb-bridge`.
 2. The **user** loads it once in each profile: `chrome://extensions` →
    Developer mode → "Load unpacked" → that folder (id
    `haagbfgnipgidagcllndobiiiejdnpjl`). After updating the extension, rerun

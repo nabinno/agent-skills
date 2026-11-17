@@ -35,7 +35,7 @@ unpacked loading.
 ## Install / update
 
 ```bash
-../scripts/cb install-bridge   # copies to %LOCALAPPDATA%\agent-skills\cb-bridge
+../scripts/cb install-bridge   # prints the folder to load (Windows: %LOCALAPPDATA%\agent-skills\cb-bridge)
 ```
 
 Then in each profile: `chrome://extensions` → Developer mode → "Load

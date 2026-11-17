@@ -1,12 +1,12 @@
 # agent-browser-current-browser
 
-Drive the Chrome or Edge window already open on Windows, from a shell inside WSL2. Existing tabs and login state stay. Several agents can share that browser; each one gets its own background tab.
+Drive the Chrome or Edge window already open on this machine. Existing tabs and login state stay. Several agents can share that browser; each one gets its own background tab. The same `scripts/cb` runs on macOS, in Windows PowerShell, and inside WSL2. Host differences sit in `scripts/platform.mjs`.
 
 Use this when the request is about the browser you already have open (「今開いているブラウザで」「現在のブラウザで」), or when it names a Chrome profile or tab group.
 
 ## Before the first use
 
-1. Turn on WSL2 mirrored networking. In `C:\Users\<you>\.wslconfig`:
+1. On WSL2 only, turn on mirrored networking. macOS and Windows PowerShell share loopback with Chrome, so this step does not apply there. In `C:\Users\<you>\.wslconfig`:
 
    ```
    [wsl2]
@@ -43,5 +43,7 @@ $CB <printed-name> done
 ```
 
 `done` only detaches. `done --close` closes the tabs that session opened. `$CB <name> show` brings its tab to the front when you want to watch.
+
+On Windows PowerShell, `scripts/cb.cmd` is the launcher (`#!` is not used there). `node scripts/cb` is the same script.
 
 Do not drive the browser with a bare `agent-browser connect`. That opens another debugging connection and collides with other sessions. Agent rules for profiles, tab groups, and Slack links are in `SKILL.md`.
