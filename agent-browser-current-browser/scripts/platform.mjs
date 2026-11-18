@@ -235,8 +235,9 @@ export function displayPath(p) {
   return r.out;
 }
 
-// Linux keeps the /proc check so a zombie from a detached child counts as dead.
-// macOS and Windows have no /proc; process.kill(pid, 0) is the existence test.
+// A detached child that exits stays a zombie while cb blocks in sleepSync, and
+// process.kill(pid, 0) succeeds on a zombie. Linux reads /proc and macOS asks
+// ps, so a zombie counts as dead. Windows has no zombies; kill(pid, 0) is enough.
 export function pidAlive(pid) {
   const n = Number(pid);
   if (!Number.isInteger(n) || n <= 0) return false;
@@ -246,6 +247,11 @@ export function pidAlive(pid) {
     } catch {
       return false;
     }
+  }
+  if (process.platform === "darwin") {
+    const r = spawnSync("ps", ["-o", "stat=", "-p", String(n)], { encoding: "utf8", timeout: 5000 });
+    if (r.status === 0) return !r.stdout.trim().startsWith("Z");
+    if (r.status === 1) return false;
   }
   try {
     process.kill(n, 0);

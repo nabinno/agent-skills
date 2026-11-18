@@ -330,6 +330,13 @@ function shutdown(code) {
 }
 process.on("SIGTERM", () => shutdown(0));
 process.on("SIGINT", () => shutdown(0));
+// cb starts the hub with stdio ignored, so a crash is only visible in the log file.
+for (const event of ["uncaughtException", "unhandledRejection"]) {
+  process.on(event, (err) => {
+    log(`${event}:`, err?.stack ?? err);
+    shutdown(1);
+  });
+}
 
 up = new WebSocket(UPSTREAM_URL);
 up.onmessage = (e) => {
