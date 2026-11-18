@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// cb — run agent-browser against the user's current Windows Chrome in an
+// cb — run agent-browser against the user's current Chrome in an
 // isolated, tab-pinned session, optionally scoped to a Chrome profile and a
 // tab group, so several agents can work concurrently without colliding.
+// Host differences (macOS, Windows PowerShell, WSL) live in platform.mjs.
 //
 //   cb new                                   default: a new group "🤖 cb-…" in the last active
 //                                            profile (ungrouped tab if cb-bridge isn't there)
@@ -11,7 +12,7 @@
 //                                            scope = a new group created for this agent
 //                                            (in the profile's last used window, or a new one)
 //   cb profiles                              profiles, cb-bridge status and tab groups
-//   cb install-bridge                        copy cb-bridge to Windows for "Load unpacked"
+//   cb install-bridge                        copy cb-bridge for "Load unpacked"
 //   cb hub [status|start|stop]               the shared Chrome connection (see cb-hub.mjs)
 //
 //   cb <session> <agent-browser args...>     run a command in the session (scope-checked)
@@ -34,18 +35,20 @@
 // reached over CDP. Profiles are identified by matching the signed-in email it
 // reports against Chrome's "Local State".
 
-import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { bridgeDir, chromeUserDataDir, chromeWebSocketUrl, displayPath, pidAlive, run as hostRun, spawnDetached } from "./platform.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE_DIR = path.resolve(HERE, "../cb-bridge");
 const BRIDGE_ID = "haagbfgnipgidagcllndobiiiejdnpjl"; // fixed by manifest "key"
-const CDP_HELPER = process.env.CDP_HELPER ?? path.join(HERE, "cdp");
 const TIMEOUT_S = Number(process.env.CB_TIMEOUT ?? 25);
+function run(cmd, args, opts = {}) {
+  return hostRun(cmd, args, { timeout: TIMEOUT_S, ...opts });
+}
 const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"), "cb");
 const STATE_DIR = path.join(CACHE_DIR, "sessions");
 const HUB_SCRIPT = path.join(HERE, "cb-hub.mjs");
@@ -68,28 +71,15 @@ const die = (msg) => {
 
 // ---------------------------------------------------------------- helpers
 
-function run(cmd, args, { timeout = TIMEOUT_S, input } = {}) {
-  const r = spawnSync("timeout", [String(timeout), cmd, ...args], { encoding: "utf8", input });
-  return { code: r.status, out: r.stdout ?? "", err: r.stderr ?? "" };
-}
-
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-
-function pidAlive(pid) {
-  try {
-    // a detached child that exited stays a zombie until reaped; treat that as dead
-    return !/^\d+ \(.*\) Z/.test(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
-  } catch {
-    return false;
-  }
-}
 
 // The real Chrome endpoint (only cb-hub connects to it).
 function chromeUrl() {
-  const env = { ...process.env, CDP_CHROME_USER_DATA_DIR: userDataDir().chrome };
-  const r = spawnSync("timeout", ["20", "python3", CDP_HELPER, "--url"], { encoding: "utf8", env });
-  if (r.status !== 0) die(`could not resolve Chrome's CDP URL (is remote debugging enabled?)\n${(r.stderr ?? "").trim()}`);
-  return r.stdout.trim();
+  try {
+    return chromeWebSocketUrl();
+  } catch (error) {
+    die(`could not resolve Chrome's CDP URL (is remote debugging enabled?)\n${error.message}`);
+  }
 }
 
 function readHub() {
@@ -123,9 +113,12 @@ function startHub() {
   try {
     const hub = readHub();
     if (hub) return hub;
-    const out = fs.openSync(HUB_LOG, "a", 0o600);
-    const child = spawn(process.execPath, [HUB_SCRIPT, chromeUrl(), HUB_STATE], { detached: true, stdio: ["ignore", out, out] });
-    child.unref();
+    let child;
+    try {
+      child = spawnDetached(process.execPath, [HUB_SCRIPT, chromeUrl(), HUB_STATE, HUB_LOG]);
+    } catch (error) {
+      die(`could not start cb-hub: ${error.message}`);
+    }
     process.stderr.write(
       'cb: connecting to Chrome. If Chrome asks "Allow remote debugging?", allow it once; cb reuses this connection from now on.\n',
     );
@@ -181,28 +174,8 @@ function abJson(session, args) {
 
 const abTabs = (session) => abJson(session, ["tab", "list"]).tabs;
 
-let USER_DATA;
-function userDataDir() {
-  if (process.env.CDP_CHROME_USER_DATA_DIR) return { local: null, chrome: process.env.CDP_CHROME_USER_DATA_DIR };
-  if (USER_DATA) return USER_DATA;
-  const cache = path.join(CACHE_DIR, "userdata.json"); // powershell.exe is slow; the path doesn't change
-  try {
-    return (USER_DATA = JSON.parse(fs.readFileSync(cache, "utf8")));
-  } catch {}
-  const r = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Write-Output $env:LOCALAPPDATA"], {
-    timeout: 15,
-  });
-  const win = r.out.trim();
-  if (!win) die("could not read Windows LOCALAPPDATA");
-  const u = run("wslpath", ["-u", win]).out.trim();
-  USER_DATA = { local: u, chrome: path.join(u, "Google/Chrome/User Data") };
-  fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(cache, JSON.stringify(USER_DATA));
-  return USER_DATA;
-}
-
 function localStateProfiles() {
-  const ls = JSON.parse(fs.readFileSync(path.join(userDataDir().chrome, "Local State"), "utf8"));
+  const ls = JSON.parse(fs.readFileSync(path.join(chromeUserDataDir(), "Local State"), "utf8"));
   return Object.entries(ls.profile?.info_cache ?? {}).map(([dir, v]) => ({
     dir,
     name: v.name ?? "",
@@ -649,16 +622,14 @@ async function cmdProfiles() {
 }
 
 function cmdInstallBridge() {
-  const d = userDataDir();
-  if (!d.local) die("unset CDP_CHROME_USER_DATA_DIR so cb can locate %LOCALAPPDATA%");
-  const dest = path.join(d.local, "agent-skills", "cb-bridge");
+  const dest = bridgeDir();
   fs.mkdirSync(dest, { recursive: true });
   for (const f of ["manifest.json", "background.js"]) fs.copyFileSync(path.join(BRIDGE_DIR, f), path.join(dest, f));
-  const win = run("wslpath", ["-w", dest]).out.trim();
-  console.log(`copied cb-bridge to ${win}
+  const shown = displayPath(dest);
+  console.log(`copied cb-bridge to ${shown}
 In EACH Chrome profile you want to scope to:
   1. open chrome://extensions and turn on Developer mode
-  2. "Load unpacked" -> ${win}   (after updates: click the reload icon instead)
+  2. "Load unpacked" -> ${shown}   (after updates: click the reload icon instead)
 Extension id should be ${BRIDGE_ID}. Then check with: cb profiles`);
 }
 
@@ -935,9 +906,9 @@ function rewriteOpen(session, argv) {
 
 function passthrough(session, argv, exit = true) {
   argv = rewriteOpen(session, argv);
-  const r = spawnSync("timeout", [String(TIMEOUT_S), "agent-browser", "--session", session, ...argv], { stdio: "inherit" });
-  if (exit) process.exit(r.status ?? 1);
-  return r.status ?? 1;
+  const r = run("agent-browser", ["--session", session, ...argv], { timeout: TIMEOUT_S, stdio: "inherit" });
+  if (exit) process.exit(r.code ?? 1);
+  return r.code ?? 1;
 }
 
 // ---------------------------------------------------------------- main

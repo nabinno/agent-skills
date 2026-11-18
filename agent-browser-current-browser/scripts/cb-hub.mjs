@@ -18,19 +18,27 @@
 // subscription. Target.setDiscoverTargets / Target.setAutoAttach at browser
 // level are emulated per client so clients don't interfere.
 //
-// Usage: cb-hub.mjs <upstream ws url> <state file>   (normally started by cb)
+// Usage: cb-hub.mjs <upstream ws url> <state file> [log file]   (normally started by cb)
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const [UPSTREAM_URL, STATE_FILE] = process.argv.slice(2);
+const [UPSTREAM_URL, STATE_FILE, LOG_FILE] = process.argv.slice(2);
 if (!UPSTREAM_URL || !STATE_FILE) {
-  console.error("usage: cb-hub.mjs <upstream ws url> <state file>");
+  console.error("usage: cb-hub.mjs <upstream ws url> <state file> [log file]");
   process.exit(2);
 }
 const LOG = !!process.env.CB_HUB_LOG;
-const log = (...a) => console.error(new Date().toISOString(), ...a);
+const log = (...a) => {
+  const line = [new Date().toISOString(), ...a].map(String).join(" ");
+  if (!LOG_FILE) return console.error(line);
+  try {
+    fs.appendFileSync(LOG_FILE, line + "\n", { mode: 0o600 });
+  } catch {
+    console.error(line);
+  }
+};
 const TOKEN = randomBytes(24).toString("hex");
 const BLOCKED_METHODS = new Set(["Browser.close", "Browser.crash", "Browser.crashGpuProcess"]);
 
@@ -322,6 +330,13 @@ function shutdown(code) {
 }
 process.on("SIGTERM", () => shutdown(0));
 process.on("SIGINT", () => shutdown(0));
+// cb starts the hub with stdio ignored, so a crash is only visible in the log file.
+for (const event of ["uncaughtException", "unhandledRejection"]) {
+  process.on(event, (err) => {
+    log(`${event}:`, err?.stack ?? err);
+    shutdown(1);
+  });
+}
 
 up = new WebSocket(UPSTREAM_URL);
 up.onmessage = (e) => {
