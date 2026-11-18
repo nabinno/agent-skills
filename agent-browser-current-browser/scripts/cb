@@ -35,13 +35,12 @@
 // reached over CDP. Profiles are identified by matching the signed-in email it
 // reports against Chrome's "Local State".
 
-import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { bridgeDir, chromeUserDataDir, chromeWebSocketUrl, displayPath, pidAlive, run as hostRun } from "./platform.mjs";
+import { bridgeDir, chromeUserDataDir, chromeWebSocketUrl, displayPath, pidAlive, run as hostRun, spawnDetached } from "./platform.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE_DIR = path.resolve(HERE, "../cb-bridge");
@@ -114,9 +113,12 @@ function startHub() {
   try {
     const hub = readHub();
     if (hub) return hub;
-    const out = fs.openSync(HUB_LOG, "a", 0o600);
-    const child = spawn(process.execPath, [HUB_SCRIPT, chromeUrl(), HUB_STATE], { detached: true, stdio: ["ignore", out, out] });
-    child.unref();
+    let child;
+    try {
+      child = spawnDetached(process.execPath, [HUB_SCRIPT, chromeUrl(), HUB_STATE, HUB_LOG]);
+    } catch (error) {
+      die(`could not start cb-hub: ${error.message}`);
+    }
     process.stderr.write(
       'cb: connecting to Chrome. If Chrome asks "Allow remote debugging?", allow it once; cb reuses this connection from now on.\n',
     );

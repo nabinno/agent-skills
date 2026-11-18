@@ -5,7 +5,7 @@
 // WSL is detected before a plain Linux host, because process.platform is
 // "linux" in both cases.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -31,13 +31,157 @@ function isWsl() {
 
 const cacheDir = () => path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"), "cb");
 
+// CreateProcess does not search PATHEXT. npm's global shim is an extensionless
+// shell script plus a sibling .cmd; executing the script returns ENOENT and
+// never reaches the real .exe. Prefer name.exe, then an .exe named inside an
+// npm .cmd shim. A bare .cmd/.bat is started through ProcessStartInfo so "&"
+// in an argument is not reparsed as another command.
+function existsFile(file) {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function searchPathWin(name) {
+  const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  for (const ext of [".exe", ".com", ".cmd", ".bat"]) {
+    for (const dir of dirs) {
+      const candidate = path.join(dir, name + ext);
+      if (existsFile(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function exeFromCmdShim(cmdPath) {
+  let text;
+  try {
+    text = fs.readFileSync(cmdPath, "utf8");
+  } catch {
+    return null;
+  }
+  const match = text.match(/"%~dp0([^"]+\.exe)"/i);
+  if (!match) return null;
+  const exe = path.join(path.dirname(cmdPath), match[1]);
+  return existsFile(exe) ? exe : null;
+}
+
+function quoteWinArg(arg) {
+  const s = String(arg);
+  if (s === "" || /[\s"]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function spawnSpec(cmd, args) {
+  const plain = { file: cmd, args };
+  if (process.platform !== "win32" || path.isAbsolute(cmd) || /[\\/]/.test(cmd)) return plain;
+  const ext = path.extname(cmd).toLowerCase();
+  if (ext === ".exe" || ext === ".com" || ext === ".cmd" || ext === ".bat") return plain;
+  const found = searchPathWin(cmd);
+  if (!found) return plain;
+  const foundExt = path.extname(found).toLowerCase();
+  if (foundExt === ".exe" || foundExt === ".com") return { file: found, args };
+  const exe = exeFromCmdShim(found);
+  if (exe) return { file: exe, args };
+  // The call operator reparses "&" when the target is a batch file.
+  // ProcessStartInfo quotes each argument, which cmd.exe then keeps intact.
+  const ps = [
+    "$psi = New-Object System.Diagnostics.ProcessStartInfo",
+    "$psi.FileName = $env:CB_CMD_FILE",
+    "$psi.UseShellExecute = $false",
+    "$psi.CreateNoWindow = $true",
+    "$psi.RedirectStandardOutput = $true",
+    "$psi.RedirectStandardError = $true",
+    "$sb = New-Object System.Text.StringBuilder",
+    "for ($i = 0; $i -lt [int]$env:CB_CMD_COUNT; $i++) {",
+    "  if ($i -gt 0) { [void]$sb.Append(' ') }",
+    "  $val = (Get-Item -Path env:\\CB_CMD_ARG_$i).Value",
+    "  if ($null -eq $val) { $val = '' }",
+    "  [void]$sb.Append([char]34).Append($val.Replace(([char]34).ToString(), ([char]34).ToString() + ([char]34).ToString())).Append([char]34)",
+    "}",
+    "$psi.Arguments = $sb.ToString()",
+    "$proc = [Diagnostics.Process]::Start($psi)",
+    "$stdout = $proc.StandardOutput.ReadToEnd()",
+    "$stderr = $proc.StandardError.ReadToEnd()",
+    "$proc.WaitForExit()",
+    "[Console]::Out.Write($stdout)",
+    "[Console]::Error.Write($stderr)",
+    "exit $proc.ExitCode",
+  ].join("; ");
+  const env = { CB_CMD_FILE: found, CB_CMD_COUNT: String(args.length) };
+  args.forEach((arg, i) => {
+    env[`CB_CMD_ARG_${i}`] = String(arg);
+  });
+  return {
+    file: "powershell.exe",
+    args: ["-NoProfile", "-NonInteractive", "-Command", ps],
+    env,
+  };
+}
+
+function launchSync(cmd, args, { timeout = 25, input, stdio } = {}) {
+  const spec = spawnSpec(cmd, args);
+  return spawnSync(spec.file, spec.args, {
+    encoding: "utf8",
+    input,
+    timeout: timeout * 1000,
+    stdio: stdio ?? "pipe",
+    windowsHide: true,
+    env: spec.env ? { ...process.env, ...spec.env } : undefined,
+  });
+}
+
 function spawnText(cmd, args, timeoutSec) {
-  const r = spawnSync(cmd, args, { encoding: "utf8", timeout: timeoutSec * 1000, windowsHide: true });
+  const r = launchSync(cmd, args, { timeout: timeoutSec });
   return {
     code: r.status ?? (r.error ? 1 : 0),
     out: (r.stdout ?? "").replace(/\r/g, "").trim(),
     err: [r.stderr, r.error?.message].filter(Boolean).join("\n").trim(),
   };
+}
+
+function decodeOutput(buf) {
+  if (!buf || buf.length === 0) return "";
+  if (buf[0] === 0xff && buf[1] === 0xfe) return buf.slice(2).toString("utf16le");
+  let zeros = 0;
+  const n = Math.min(buf.length, 32);
+  for (let i = 1; i < n; i += 2) if (buf[i] === 0) zeros++;
+  if (zeros > 4) return buf.toString("utf16le");
+  return buf.toString("utf8");
+}
+
+// A detached child of this process stays in the caller's Windows job. The job
+// kills it when the command ends, so the next cb opens a new Chrome connection
+// and the permission dialog appears again. Win32_Process.Create runs from
+// WmiPrvSE, outside that job, and the hub keeps the one approved connection.
+function spawnDetachedWindows(execPath, args) {
+  const commandLine = [execPath, ...args].map(quoteWinArg).join(" ");
+  const ps = [
+    "$ErrorActionPreference = 'Stop'",
+    "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false",
+    "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $env:CB_DETACH_CMDLINE }",
+    "if ([int]$r.ReturnValue -ne 0) { Write-Output ('ERR ' + $r.ReturnValue); exit 1 }",
+    "Write-Output $r.ProcessId",
+  ].join("; ");
+  const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+    windowsHide: true,
+    env: { ...process.env, CB_DETACH_CMDLINE: commandLine },
+  });
+  const out = decodeOutput(r.stdout).trim();
+  const err = decodeOutput(r.stderr).trim();
+  const pid = Number((out.match(/\d+/) || [])[0]);
+  if (r.status !== 0 || !pid) throw new Error(err || out || "Win32_Process.Create failed");
+  return { pid };
+}
+
+// Start a process that outlives this command. logFile is opened by the child.
+export function spawnDetached(execPath, args) {
+  if (process.platform === "win32") return spawnDetachedWindows(execPath, args);
+  const child = spawn(execPath, args, { detached: true, stdio: "ignore" });
+  child.unref();
+  return { pid: child.pid };
 }
 
 let wslLocal;
@@ -134,13 +278,7 @@ export function pidAlive(pid) {
 
 // timeout is seconds. Uses Node's own timer so GNU timeout is not required.
 export function run(cmd, args, { timeout = 25, input, stdio } = {}) {
-  const r = spawnSync(cmd, args, {
-    encoding: "utf8",
-    input,
-    timeout: timeout * 1000,
-    stdio: stdio ?? "pipe",
-    windowsHide: true,
-  });
+  const r = launchSync(cmd, args, { timeout, input, stdio });
   return {
     code: r.status ?? (r.error ? 1 : 0),
     out: r.stdout ?? "",
