@@ -3,8 +3,7 @@
 // session unless invoked with no flags (that execs `agent-browser connect`).
 // Host selection lives in platform.mjs.
 
-import { spawnSync } from "node:child_process";
-import { checkTcp, chromeWebSocketUrl, hostKind } from "./platform.mjs";
+import { checkTcp, chromeWebSocketUrl, hostKind, run } from "./platform.mjs";
 
 const hint =
   hostKind() === "wsl"
@@ -20,12 +19,12 @@ try {
     await checkTcp(url);
     console.log("ChromeのCDPポートに到達できます（ブラウザ側の接続許可は未確認）。");
   } else if (args.length === 0) {
-    const found = spawnSync("agent-browser", ["connect", url], { stdio: "inherit", windowsHide: true });
-    if (found.error) {
-      console.error("agent-browserがPATHに見つかりません。");
+    const found = run("agent-browser", ["connect", url], { stdio: "inherit" });
+    if (found.err) {
+      console.error(found.err);
       process.exit(1);
     }
-    process.exit(found.status ?? 1);
+    process.exit(found.code ?? 1);
   } else {
     console.error("usage: cdp [--url|--check]");
     process.exit(2);

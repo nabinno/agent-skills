@@ -34,8 +34,8 @@ const cacheDir = () => path.join(process.env.XDG_CACHE_HOME ?? path.join(os.home
 // CreateProcess does not search PATHEXT. npm's global shim is an extensionless
 // shell script plus a sibling .cmd; executing the script returns ENOENT and
 // never reaches the real .exe. Prefer name.exe, then an .exe named inside an
-// npm .cmd shim. A bare .cmd/.bat is started through ProcessStartInfo so "&"
-// in an argument is not reparsed as another command.
+// npm .cmd shim, or launch its Node entry point directly. Never forward arbitrary
+// arguments through cmd.exe: batch expansion changes percent signs and quoting.
 function existsFile(file) {
   try {
     return fs.statSync(file).isFile();
@@ -55,7 +55,7 @@ function searchPathWin(name) {
   return null;
 }
 
-function exeFromCmdShim(cmdPath) {
+function commandFromCmdShim(cmdPath) {
   let text;
   try {
     text = fs.readFileSync(cmdPath, "utf8");
@@ -63,9 +63,18 @@ function exeFromCmdShim(cmdPath) {
     return null;
   }
   const match = text.match(/"%~dp0([^"]+\.exe)"/i);
-  if (!match) return null;
-  const exe = path.join(path.dirname(cmdPath), match[1]);
-  return existsFile(exe) ? exe : null;
+  if (match) {
+    const exe = path.join(path.dirname(cmdPath), match[1]);
+    if (existsFile(exe)) return { file: exe, args: [] };
+  }
+  // npm/cmd-shim uses either %dp0% or %~dp0 for the package entry point.
+  // Require the node invocation and trailing %*; do not interpret arbitrary batch.
+  const node = text.match(/(?:"%_prog%"|"?node(?:\.exe)?"?|"%~dp0\\?node\.exe")\s+"%(?:dp0%|~dp0)[\\/]?([^"\r\n]+\.(?:[cm]?js))"\s+%\*/i);
+  if (!node) return null;
+  const entry = path.resolve(path.dirname(cmdPath), node[1]);
+  if (!existsFile(entry)) return null;
+  const localNode = path.join(path.dirname(cmdPath), "node.exe");
+  return { file: existsFile(localNode) ? localNode : process.execPath, args: [entry] };
 }
 
 function quoteWinArg(arg) {
@@ -76,49 +85,19 @@ function quoteWinArg(arg) {
 
 function spawnSpec(cmd, args) {
   const plain = { file: cmd, args };
-  if (process.platform !== "win32" || path.isAbsolute(cmd) || /[\\/]/.test(cmd)) return plain;
+  if (process.platform !== "win32") return plain;
   const ext = path.extname(cmd).toLowerCase();
-  if (ext === ".exe" || ext === ".com" || ext === ".cmd" || ext === ".bat") return plain;
-  const found = searchPathWin(cmd);
+  if (ext === ".exe" || ext === ".com") return plain;
+  const hasPath = path.isAbsolute(cmd) || /[\\/]/.test(cmd);
+  const found = ext === ".cmd" || ext === ".bat"
+    ? (hasPath ? cmd : searchPathWin(cmd.slice(0, -ext.length)))
+    : (hasPath ? null : searchPathWin(cmd));
   if (!found) return plain;
   const foundExt = path.extname(found).toLowerCase();
   if (foundExt === ".exe" || foundExt === ".com") return { file: found, args };
-  const exe = exeFromCmdShim(found);
-  if (exe) return { file: exe, args };
-  // The call operator reparses "&" when the target is a batch file.
-  // ProcessStartInfo quotes each argument, which cmd.exe then keeps intact.
-  const ps = [
-    "$psi = New-Object System.Diagnostics.ProcessStartInfo",
-    "$psi.FileName = $env:CB_CMD_FILE",
-    "$psi.UseShellExecute = $false",
-    "$psi.CreateNoWindow = $true",
-    "$psi.RedirectStandardOutput = $true",
-    "$psi.RedirectStandardError = $true",
-    "$sb = New-Object System.Text.StringBuilder",
-    "for ($i = 0; $i -lt [int]$env:CB_CMD_COUNT; $i++) {",
-    "  if ($i -gt 0) { [void]$sb.Append(' ') }",
-    "  $val = (Get-Item -Path env:\\CB_CMD_ARG_$i).Value",
-    "  if ($null -eq $val) { $val = '' }",
-    "  [void]$sb.Append([char]34).Append($val.Replace(([char]34).ToString(), ([char]34).ToString() + ([char]34).ToString())).Append([char]34)",
-    "}",
-    "$psi.Arguments = $sb.ToString()",
-    "$proc = [Diagnostics.Process]::Start($psi)",
-    "$stdout = $proc.StandardOutput.ReadToEnd()",
-    "$stderr = $proc.StandardError.ReadToEnd()",
-    "$proc.WaitForExit()",
-    "[Console]::Out.Write($stdout)",
-    "[Console]::Error.Write($stderr)",
-    "exit $proc.ExitCode",
-  ].join("; ");
-  const env = { CB_CMD_FILE: found, CB_CMD_COUNT: String(args.length) };
-  args.forEach((arg, i) => {
-    env[`CB_CMD_ARG_${i}`] = String(arg);
-  });
-  return {
-    file: "powershell.exe",
-    args: ["-NoProfile", "-NonInteractive", "-Command", ps],
-    env,
-  };
+  const target = commandFromCmdShim(found);
+  if (target) return { file: target.file, args: [...target.args, ...args] };
+  throw new Error(`Cannot safely execute batch file: ${found}. Use its executable or Node entry point instead.`);
 }
 
 function launchSync(cmd, args, { timeout = 25, input, stdio } = {}) {

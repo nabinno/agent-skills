@@ -46,4 +46,13 @@ $CB <printed-name> done
 
 On Windows PowerShell, `scripts/cb.cmd` is the launcher (`#!` is not used there). `node scripts/cb` is the same script.
 
+On Windows, child commands resolve to native executables or recognized npm shims
+that point to an executable or a `.js`, `.cjs`, or `.mjs` Node entry point.
+Other batch files are rejected with an explicit error; use their executable or
+Node entry point instead. This preserves Unicode, empty arguments, and literal
+percent signs without cmd.exe expansion.
+
+Run the host-layer regression tests with
+`node --test agent-browser-current-browser/scripts/platform.test.mjs` from the repository root.
+
 Do not drive the browser with a bare `agent-browser connect`. That opens another debugging connection and collides with other sessions. Agent rules for profiles, tab groups, and Slack links are in `SKILL.md`.
