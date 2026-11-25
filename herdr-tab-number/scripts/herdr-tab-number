@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# herdr-tab-number — prefix every Herdr tab name with a two-digit number so
+# the Go to picker (prefix+g) can jump to a tab with "/", two digits, Enter.
+#
+# The first digit is the workspace number, the second the tab's position in
+# that workspace (1-9). Tabs named like --zero (default "~", a plain shell)
+# get 0, e.g. IMS(1): "11 emacs", "12 gpt", ..., "10 ~".
+#
+# Usage:
+#   herdr-tab-number apply [--workspace <id>] [--zero <label>] [--dry-run]
+#   herdr-tab-number strip [--workspace <id>] [--dry-run]
+#   herdr-tab-number status
+#
+# Re-running apply renumbers: an existing "NN " prefix is replaced, so it is
+# safe after adding, closing, or reordering tabs. Afterwards the pane names
+# written by herdr-session-marker ("<tab label> ○/●") are refreshed with the
+# same mark, because Go to shows the pane name before the tab name.
+set -uo pipefail
+
+HERDR="${HERDR_BIN_PATH:-herdr}"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+MARKER="$SELF_DIR/../../herdr-session-marker/scripts/herdr-session-marker"
+PREFIX_RE='^[0-9][0-9] '
+
+die() { echo "herdr-tab-number: $*" >&2; exit 1; }
+
+command -v "$HERDR" >/dev/null 2>&1 || die "herdr not found"
+command -v jq >/dev/null 2>&1 || die "jq not found"
+
+strip_prefix() { sed -E "s/$PREFIX_RE//" <<<"$1"; }
+
+# tab rows in display order: workspace_id, workspace number, tab_id, label
+tab_rows() {
+  local ws_json
+  ws_json="$("$HERDR" workspace list)" || die "cannot list workspaces (outside Herdr?)"
+  "$HERDR" tab list | jq -r --argjson ws "$ws_json" '
+    ($ws.result.workspaces | map({key: .workspace_id, value: .number}) | from_entries) as $num
+    | .result.tabs[]
+    | [.workspace_id, ($num[.workspace_id] // 0 | tostring), .tab_id, .label] | @tsv'
+}
+
+rename_tab() {
+  local tab="$1" old="$2" new="$3" dry="$4"
+  [ "$old" = "$new" ] && return 0
+  if [ -n "$dry" ]; then
+    echo "would rename $tab: '$old' -> '$new'"
+  else
+    "$HERDR" tab rename "$tab" "$new" >/dev/null || { echo "failed: $tab" >&2; return 1; }
+    echo "$tab: '$old' -> '$new'"
+  fi
+}
+
+# Re-apply each existing ○/● mark so pane names carry the new tab label.
+refresh_marks() {
+  [ -x "$MARKER" ] || return 0
+  local pane mark
+  while IFS=$'\t' read -r pane mark; do
+    [ "$mark" = fresh ] || [ "$mark" = session ] || continue
+    "$MARKER" set "$pane" "$mark" >/dev/null 2>&1 || echo "mark refresh failed: $pane" >&2
+  done < <("$MARKER" status | awk '{print $1 "\t" $4}')
+  echo "refreshed herdr-session-marker pane names"
+}
+
+apply() {
+  local only_ws="" zero="~" dry=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workspace) only_ws="$2"; shift 2 ;;
+      --zero) zero="$2"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  local -A pos=()
+  local ws wsnum tab label base n
+  while IFS=$'\t' read -r ws wsnum tab label; do
+    [ -n "$only_ws" ] && [ "$ws" != "$only_ws" ] && continue
+    base="$(strip_prefix "$label")"
+    if [ "$wsnum" -lt 1 ] || [ "$wsnum" -gt 9 ]; then
+      echo "skip $tab '$label': workspace number $wsnum is not 1-9" >&2; continue
+    fi
+    if [ "$base" = "$zero" ]; then
+      n="${wsnum}0"
+    else
+      pos[$ws]=$(( ${pos[$ws]:-0} + 1 ))
+      if [ "${pos[$ws]}" -gt 9 ]; then
+        echo "skip $tab '$base': more than 9 tabs in workspace $wsnum" >&2; continue
+      fi
+      n="${wsnum}${pos[$ws]}"
+    fi
+    rename_tab "$tab" "$label" "$n $base" "$dry"
+  done < <(tab_rows)
+  [ -z "$dry" ] && refresh_marks
+  return 0
+}
+
+strip() {
+  local only_ws="" dry=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workspace) only_ws="$2"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  local ws wsnum tab label
+  while IFS=$'\t' read -r ws wsnum tab label; do
+    [ -n "$only_ws" ] && [ "$ws" != "$only_ws" ] && continue
+    rename_tab "$tab" "$label" "$(strip_prefix "$label")" "$dry"
+  done < <(tab_rows)
+  [ -z "$dry" ] && refresh_marks
+  return 0
+}
+
+status() {
+  local ws wsnum tab label
+  while IFS=$'\t' read -r ws wsnum tab label; do
+    printf '%s\t%s\t%s\n' "$ws($wsnum)" "$tab" "$label"
+  done < <(tab_rows)
+}
+
+case "${1:-}" in
+  apply) shift; apply "$@" ;;
+  strip) shift; strip "$@" ;;
+  status) status ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
