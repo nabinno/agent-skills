@@ -46,6 +46,7 @@ exist with the same name.
 ## Skills
 
 - [agent-browser-current-browser](agent-browser-current-browser/README.md) — drive the Chrome or Edge window already open on Windows, from WSL2.
+- [herdr-session-marker](herdr-session-marker/README.md) — mark each LLM CLI pane fresh (○) or in use (●) in the Herdr Go to picker.
 - [herdr-reorder-tabs](herdr-reorder-tabs/README.md) — reorder tabs in the Herdr session this agent is running in.
 - [wsl-clipboard-bridge](wsl-clipboard-bridge/README.md) — copy and paste between WSL2 and the Windows clipboard, including Japanese text.
 - [agent-plugin-fanout](agent-plugin-fanout/README.md) — install one official marketplace plugin on Claude Code, Codex, Grok Build, and Antigravity.

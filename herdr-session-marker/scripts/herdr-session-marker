@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# herdr-session-marker — show whether each LLM CLI pane holds a fresh or an
+# in-use conversation, in the Herdr Go to picker (prefix+g).
+#
+# The pane name is set to "<tab label> ○" (fresh) or "<tab label> ●" (in use).
+# The Go to row label prefers the pane name over the tab name, while its
+# agent and status columns (claude / idle) are fixed by Herdr, so the pane
+# name is the only place a per-pane marker shows up. Tab names are untouched.
+#
+# Usage:
+#   herdr-session-marker hook <agent> [event]   CLI hook entry point (stdin = hook JSON)
+#   herdr-session-marker sync [--others fresh|session|skip] [--dry-run]
+#                                               mark every agent pane in the session
+#   herdr-session-marker set <pane_id> fresh|session
+#   herdr-session-marker unmark [<pane_id>|--all]   remove markers (pane name cleared)
+#   herdr-session-marker install | uninstall    register hooks in Claude Code, Codex,
+#                                               Grok, and Antigravity CLI
+#   herdr-session-marker status                 list agent panes with their marker
+set -uo pipefail
+
+FRESH="○"
+SESSION="●"
+HERDR="${HERDR_BIN_PATH:-herdr}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+HOOK_NAME="herdr-session-marker"
+
+die() { echo "herdr-session-marker: $*" >&2; exit 1; }
+have_herdr() { command -v "$HERDR" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- marking
+
+mark_char() { case "$1" in fresh) echo "$FRESH" ;; session) echo "$SESSION" ;; *) return 1 ;; esac; }
+
+# Strip a trailing " ○"/" ●" so a marked label maps back to its base.
+strip_mark() { local s="$1"; s="${s% $FRESH}"; s="${s% $SESSION}"; printf '%s' "$s"; }
+
+current_mark() {
+  case "$1" in
+    *" $FRESH") echo fresh ;;
+    *" $SESSION") echo session ;;
+    *) echo none ;;
+  esac
+}
+
+# mark_pane <pane_id> fresh|session [dry-run]
+mark_pane() {
+  local pane="$1" state="$2" dry="${3:-}" pane_json tab_id label tab_label want
+  pane_json="$("$HERDR" pane get "$pane" 2>/dev/null)" || return 1
+  tab_id="$(jq -r '.result.pane.tab_id // empty' <<<"$pane_json")"
+  label="$(jq -r '.result.pane.label // empty' <<<"$pane_json")"
+  [ -n "$tab_id" ] || return 1
+  tab_label="$("$HERDR" tab get "$tab_id" 2>/dev/null | jq -r '.result.tab.label // empty')"
+  [ -n "$tab_label" ] || return 1
+  want="$(strip_mark "$tab_label") $(mark_char "$state")"
+  [ "$label" = "$want" ] && return 0
+  if [ -n "$dry" ]; then
+    echo "would rename $pane: '${label}' -> '$want'"
+  else
+    "$HERDR" pane rename "$pane" "$want" >/dev/null 2>&1
+  fi
+}
+
+# ---------------------------------------------------------------- hook mode
+
+# Is the CLI process an explicit resume? Used when the hook payload carries no
+# start source (Antigravity CLI's SessionStart has no fields).
+launched_as_resume() {
+  local pid="$PPID" i cmd
+  for i in 1 2 3 4 5 6; do
+    [ -r "/proc/$pid/cmdline" ] || break
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline")"
+    case " $cmd " in
+      *" --conversation"* | *" --resume"* | *" --continue"* | *" resume "*) return 0 ;;
+    esac
+    pid="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)" || break
+    [ -n "$pid" ] && [ "$pid" -gt 1 ] || break
+  done
+  return 1
+}
+
+hook() {
+  local agent="${1:-unknown}" event="${2:-}" input source state
+  input="$(cat)"
+  # Antigravity CLI expects a JSON object on stdout; the others must stay
+  # silent (Claude Code adds UserPromptSubmit stdout to the model context).
+  [ "$agent" = agy ] && trap 'printf "{}\n"' EXIT
+
+  [ -n "${HERDR_PANE_ID:-}" ] || exit 0
+  have_herdr || exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+
+  [ -n "$event" ] || event="$(jq -r '.hook_event_name // .hookEventName // empty' <<<"$input" 2>/dev/null)"
+  source="$(jq -r '.source // empty' <<<"$input" 2>/dev/null)"
+
+  case "$event" in
+    SessionStart)
+      case "$source" in
+        startup | clear | new) state=fresh ;;           # Claude/Codex: startup, clear; Grok: new (/new, /clear)
+        resume | compact | load) state=session ;;       # Grok: load
+        "") if launched_as_resume; then state=session; else state=fresh; fi ;;
+        *) state=session ;;
+      esac ;;
+    UserPromptSubmit | PreInvocation) state=session ;;
+    *) exit 0 ;;
+  esac
+  mark_pane "$HERDR_PANE_ID" "$state"
+  exit 0
+}
+
+# ---------------------------------------------------------------- bulk mode
+
+claude_dirs() {
+  local d seen=""
+  for d in "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude-bedrock" "$HOME/.claude"; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    d="$(readlink -f "$d")"
+    case " $seen " in *" $d "*) continue ;; esac
+    seen="$seen $d"; echo "$d"
+  done
+}
+
+# Claude: a conversation is in use once the model has answered. A session
+# that was only started or /clear-ed has user/system entries (the /clear
+# command itself is logged as a user entry) but no assistant entry.
+claude_state() {
+  local sid="$1" d f=""
+  for d in $(claude_dirs); do
+    f="$(find "$d/projects" -maxdepth 2 -name "$sid.jsonl" 2>/dev/null | head -1)"
+    [ -n "$f" ] && break
+  done
+  if [ -n "$f" ] && grep -q '"type":"assistant"' "$f"; then echo session; else echo fresh; fi
+}
+
+sync_all() {
+  local others=skip dry=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --others) others="${2:-}"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  case "$others" in fresh | session | skip) ;; *) die "--others must be fresh, session, or skip" ;; esac
+  have_herdr || die "herdr not found"
+
+  local agents row pane agent status sid state why
+  agents="$("$HERDR" agent list | jq -c '.result.agents[]')"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    pane="$(jq -r .pane_id <<<"$row")"
+    agent="$(jq -r '.agent // empty' <<<"$row")"
+    status="$(jq -r .agent_status <<<"$row")"
+    sid="$(jq -r '.agent_session.value // empty' <<<"$row")"
+    case "$status" in
+      working | blocked | done) state=session; why="status=$status" ;;
+      *)
+        if [ "$agent" = claude ] && [ -n "$sid" ]; then
+          state="$(claude_state "$sid")"; why="transcript"
+        elif [ "$others" != skip ]; then
+          state="$others"; why="--others"
+        else
+          echo "skip $pane ($agent, $status): no session record; pass --others fresh|session"
+          continue
+        fi ;;
+    esac
+    mark_pane "$pane" "$state" "$dry"
+    [ -n "$dry" ] || echo "$pane $agent -> $state ($why)"
+  done <<<"$agents"
+}
+
+set_one() {
+  [ $# -eq 2 ] || die "usage: set <pane_id> fresh|session"
+  mark_char "$2" >/dev/null || die "state must be fresh or session"
+  mark_pane "$1" "$2" || die "could not mark $1"
+}
+
+unmark() {
+  local target="${1:---all}" pane label
+  if [ "$target" != --all ]; then
+    "$HERDR" pane rename "$target" --clear >/dev/null; return
+  fi
+  while IFS=$'\t' read -r pane label; do
+    [ "$(current_mark "$label")" = none ] && continue
+    "$HERDR" pane rename "$pane" --clear >/dev/null && echo "unmarked $pane ($label)"
+  done < <("$HERDR" pane list | jq -r '.result.panes[] | [.pane_id, (.label // "")] | @tsv')
+}
+
+status_all() {
+  local pane agent st label
+  while IFS=$'\t' read -r pane agent st label; do
+    printf '%-7s %-7s %-8s %-8s %s\n' "$pane" "$agent" "$st" "$(current_mark "$label")" "$label"
+  done < <("$HERDR" agent list | jq -r '.result.agents[] | [.pane_id, (.agent // "-"), .agent_status] | @tsv' \
+           | while IFS=$'\t' read -r p a s; do
+               printf '%s\t%s\t%s\t%s\n' "$p" "$a" "$s" "$("$HERDR" pane get "$p" | jq -r '.result.pane.label // ""')"
+             done)
+}
+
+# ---------------------------------------------------------------- install
+
+# Strip our handler from a Claude/Codex-style {"hooks": {Event: [groups]}} file,
+# then optionally append it for the given events.
+edit_grouped_hooks() {
+  local file="$1" agent="$2" mode="$3" tmp cmd
+  cmd="$SELF hook $agent"
+  [ -f "$file" ] || echo '{}' >"$file"
+  tmp="$(mktemp)"
+  jq --arg cmd "$cmd" --arg self "$SELF" --arg mode "$mode" '
+    def ours: (.command // "") | (contains("herdr-session-marker"));
+    .hooks = ((.hooks // {}) | with_entries(
+        .value |= (map(.hooks |= map(select(ours | not))) | map(select((.hooks | length) > 0)))
+      ) | with_entries(select((.value | length) > 0)))
+    | if $mode == "install" then
+        reduce ("SessionStart", "UserPromptSubmit") as $ev (.;
+          .hooks[$ev] = ((.hooks[$ev] // []) + [{hooks: [{type: "command", command: $cmd, timeout: 5}]}]))
+      else . end
+    | if (.hooks | length) == 0 then del(.hooks) else . end
+  ' "$file" >"$tmp" && mv "$tmp" "$file"
+}
+
+install_all() {
+  local mode="$1" d f
+  command -v jq >/dev/null 2>&1 || die "jq is required"
+
+  # Claude Code: settings.json in every config dir in use.
+  for d in $(claude_dirs); do
+    f="$d/settings.json"
+    [ -f "$f" ] || continue
+    cp "$f" "$f.bak-herdr-session-marker"
+    edit_grouped_hooks "$f" claude "$mode" && echo "$mode: $f"
+  done
+
+  # Codex: hooks.json next to config.toml (hooks feature is stable/on in 0.171).
+  d="${CODEX_HOME:-$HOME/.codex}"
+  if [ -d "$d" ]; then
+    f="$d/hooks.json"
+    [ -f "$f" ] && cp "$f" "$f.bak-herdr-session-marker"
+    edit_grouped_hooks "$f" codex "$mode" && echo "$mode: $f"
+  fi
+
+  # Grok: merges every hooks/*.json; own a single file.
+  d="${GROK_HOME:-$HOME/.grok}"
+  if [ -d "$d" ]; then
+    f="$d/hooks/$HOOK_NAME.json"
+    if [ "$mode" = install ]; then
+      mkdir -p "$d/hooks"
+      jq -n --arg cmd "$SELF hook grok" '{hooks: {
+          SessionStart: [{hooks: [{type: "command", command: $cmd, timeout: 5}]}],
+          UserPromptSubmit: [{hooks: [{type: "command", command: $cmd, timeout: 5}]}]}}' >"$f"
+    else
+      rm -f "$f"
+    fi
+    echo "$mode: $f"
+  fi
+
+  # Antigravity CLI: hooks.json keyed by hook name; non-tool events take a flat
+  # handler list (a matcher/hooks wrapper invalidates the whole file).
+  d="${ANTIGRAVITY_CLI_CONFIG_DIR:-${GEMINI_CONFIG_DIR:-$HOME/.gemini/config}}"
+  if [ -d "$d" ]; then
+    f="$d/hooks.json"
+    if [ -f "$f" ]; then cp "$f" "$f.bak-herdr-session-marker"; else echo '{}' >"$f"; fi
+    local tmp; tmp="$(mktemp)"
+    jq --arg name "$HOOK_NAME" --arg cmd "$SELF hook agy" --arg mode "$mode" '
+      del(.[$name])
+      | if $mode == "install" then .[$name] = {
+          SessionStart: [{type: "command", command: ($cmd + " SessionStart"), timeout: 5}],
+          PreInvocation: [{type: "command", command: ($cmd + " PreInvocation"), timeout: 5}]}
+        else . end' "$f" >"$tmp" && mv "$tmp" "$f"
+    echo "$mode: $f"
+  fi
+}
+
+# ---------------------------------------------------------------- main
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  hook) hook "$@" ;;
+  sync) sync_all "$@" ;;
+  set) set_one "$@" ;;
+  unmark) unmark "$@" ;;
+  status) status_all ;;
+  install) install_all install ;;
+  uninstall) install_all uninstall ;;
+  *) sed -n '2,19p' "$SELF" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] || exit 1 ;;
+esac
