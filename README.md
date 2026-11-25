@@ -48,9 +48,10 @@ exist with the same name.
 - [agent-browser-current-browser](agent-browser-current-browser/README.md) — drive the Chrome or Edge window already open on Windows, from WSL2.
 - [herdr-session-marker](herdr-session-marker/README.md) — mark each LLM CLI pane fresh (○) or in use (●) in the Herdr Go to picker.
 - [herdr-reorder-tabs](herdr-reorder-tabs/README.md) — reorder tabs in the Herdr session this agent is running in.
-- [herdr-tab-number](herdr-tab-number/README.md) — prefix Herdr tab names with two-digit numbers to jump from Go to with `/` + two digits.
+- [herdr-tab-code](herdr-tab-code/README.md) — prefix Herdr tab names with two-letter codes (`AA`, `AB`, `CA` …) to jump from Go to with `/` + two letters.
 - [wsl-clipboard-bridge](wsl-clipboard-bridge/README.md) — copy and paste between WSL2 and the Windows clipboard, including Japanese text.
 - [agent-plugin-fanout](agent-plugin-fanout/README.md) — install one official marketplace plugin on Claude Code, Codex, Grok Build, and Antigravity.
+- [slack-reply-draft](slack-reply-draft/README.md) — type a reply with real @mentions into a Slack thread in the open browser, without sending it.
 
 ## License
 

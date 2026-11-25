@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# herdr-tab-number — prefix every Herdr tab name with a two-digit number so
-# the Go to picker (prefix+g) can jump to a tab with "/", two digits, Enter.
+# herdr-tab-code — prefix every Herdr tab name with a two-letter code so
+# the Go to picker (prefix+g) can jump to a tab with "/", two letters, Enter.
 #
-# The first digit is the workspace number, the second the tab's position in
-# that workspace (1-9). Tabs named like --zero (default "~", a plain shell)
-# get 0, e.g. IMS(1): "11 emacs", "12 gpt", ..., "10 ~".
+# The first letter is the workspace number (1=A, 2=B, ...), the second the
+# tab's position in that workspace (1=A ... 25=Y). Tabs named like --zero
+# (default "~", a plain shell) get Z, e.g. IMS(1): "AA emacs", "AB gpt", ...,
+# "AZ ~".
 #
 # Usage:
-#   herdr-tab-number apply [--workspace <id>] [--zero <label>] [--dry-run]
-#   herdr-tab-number strip [--workspace <id>] [--dry-run]
-#   herdr-tab-number status
+#   herdr-tab-code apply [--workspace <id>] [--zero <label>] [--dry-run]
+#   herdr-tab-code strip [--workspace <id>] [--dry-run]
+#   herdr-tab-code status
 #
-# Re-running apply renumbers: an existing "NN " prefix is replaced, so it is
-# safe after adding, closing, or reordering tabs. Afterwards the pane names
+# Re-running apply reassigns codes: an existing "AB " prefix (or an older "12 "
+# numeric one) is replaced, so it is safe after adding, closing, or
+# reordering tabs. Afterwards the pane names
 # written by herdr-session-marker ("<tab label> ○/●") are refreshed with the
 # same mark, because Go to shows the pane name before the tab name.
 set -uo pipefail
@@ -20,9 +22,15 @@ set -uo pipefail
 HERDR="${HERDR_BIN_PATH:-herdr}"
 SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 MARKER="$SELF_DIR/../../herdr-session-marker/scripts/herdr-session-marker"
-PREFIX_RE='^[0-9][0-9] '
+# "AB " codes, plus the old "12 " numeric prefixes so they migrate cleanly.
+PREFIX_RE='^([A-Z][A-Z]|[0-9][0-9]) '
+LETTERS=ABCDEFGHIJKLMNOPQRSTUVWXYZ
+ZERO_LETTER=Z
+MAX_TABS=25   # A-Y; Z is reserved for --zero tabs
 
-die() { echo "herdr-tab-number: $*" >&2; exit 1; }
+letter() { printf '%s' "${LETTERS:$(( $1 - 1 )):1}"; }
+
+die() { echo "herdr-tab-code: $*" >&2; exit 1; }
 
 command -v "$HERDR" >/dev/null 2>&1 || die "herdr not found"
 command -v jq >/dev/null 2>&1 || die "jq not found"
@@ -76,17 +84,17 @@ apply() {
   while IFS=$'\t' read -r ws wsnum tab label; do
     [ -n "$only_ws" ] && [ "$ws" != "$only_ws" ] && continue
     base="$(strip_prefix "$label")"
-    if [ "$wsnum" -lt 1 ] || [ "$wsnum" -gt 9 ]; then
-      echo "skip $tab '$label': workspace number $wsnum is not 1-9" >&2; continue
+    if [ "$wsnum" -lt 1 ] || [ "$wsnum" -gt 26 ]; then
+      echo "skip $tab '$label': workspace number $wsnum is not 1-26" >&2; continue
     fi
     if [ "$base" = "$zero" ]; then
-      n="${wsnum}0"
+      n="$(letter "$wsnum")$ZERO_LETTER"
     else
       pos[$ws]=$(( ${pos[$ws]:-0} + 1 ))
-      if [ "${pos[$ws]}" -gt 9 ]; then
-        echo "skip $tab '$base': more than 9 tabs in workspace $wsnum" >&2; continue
+      if [ "${pos[$ws]}" -gt "$MAX_TABS" ]; then
+        echo "skip $tab '$base': more than $MAX_TABS tabs in workspace $wsnum" >&2; continue
       fi
-      n="${wsnum}${pos[$ws]}"
+      n="$(letter "$wsnum")$(letter "${pos[$ws]}")"
     fi
     rename_tab "$tab" "$label" "$n $base" "$dry"
   done < <(tab_rows)
@@ -123,5 +131,5 @@ case "${1:-}" in
   apply) shift; apply "$@" ;;
   strip) shift; strip "$@" ;;
   status) status ;;
-  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
