@@ -10,7 +10,7 @@
 # Usage:
 #   herdr-session-marker hook <agent> [event]   CLI hook entry point (stdin = hook JSON)
 #   herdr-session-marker statusline agy         Antigravity CLI statusLine entry point
-#   herdr-session-marker sync [--others fresh|session|skip] [--dry-run]
+#   herdr-session-marker sync [--agent codex] [--others fresh|session|skip] [--dry-run]
 #                                               mark every agent pane in the session
 #   herdr-session-marker set <pane_id> fresh|session
 #   herdr-session-marker unmark [<pane_id>|--all]   remove markers (pane name cleared)
@@ -218,6 +218,22 @@ claude_state() {
   if [ -n "$f" ] && grep -q '"type":"assistant"' "$f"; then echo session; else echo fresh; fi
 }
 
+# Codex does not expose a session id to Herdr. Its untouched welcome screen is
+# recognizable even when the agent status has already changed to done/idle.
+# Other screens fall back to the existing status and mark.
+codex_state() {
+  local pane="$1" screen
+  screen="$("$HERDR" agent read "$pane" --source visible --lines 60 2>/dev/null)" || return 1
+  [[ "$screen" == *">_ OpenAI Codex ("* ]] || return 1
+  [[ "$screen" == *"› Ask Codex to do anything"* ]] || return 1
+  # A submitted turn adds another prompt or a response marker above the input.
+  if grep -E '^[[:space:]]*›' <<<"$screen" | grep -Fqv '› Ask Codex to do anything' \
+    || grep -Eq '^[[:space:]]*[•✦][[:space:]]' <<<"$screen"; then
+    return 1
+  fi
+  echo fresh
+}
+
 # Antigravity CLI: an empty or /clear-ed screen shows the Antigravity CLI logo
 # (plus any startup ┃ notice banner) followed only by blank lines and the
 # bottom prompt box (─── / > ... / ───), with no prior turn separator rules.
@@ -247,14 +263,16 @@ agy_state() {
 }
 
 sync_all() {
-  local others=skip dry=""
+  local others=skip dry="" only_agent=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --agent) only_agent="${2:-}"; shift 2 ;;
       --others) others="${2:-}"; shift 2 ;;
       --dry-run) dry=1; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
+  case "$only_agent" in "" | claude | codex | grok | agy) ;; *) die "unknown agent: $only_agent" ;; esac
   case "$others" in fresh | session | skip) ;; *) die "--others must be fresh, session, or skip" ;; esac
   have_herdr || die "herdr not found"
 
@@ -264,22 +282,27 @@ sync_all() {
     [ -n "$row" ] || continue
     pane="$(jq -r .pane_id <<<"$row")"
     agent="$(jq -r '.agent // empty' <<<"$row")"
+    [ -z "$only_agent" ] || [ "$agent" = "$only_agent" ] || continue
     status="$(jq -r .agent_status <<<"$row")"
     sid="$(jq -r '.agent_session.value // empty' <<<"$row")"
-    case "$status" in
-      working | blocked | done) state=session; why="status=$status" ;;
-      *)
-        if [ "$agent" = claude ] && [ -n "$sid" ]; then
-          state="$(claude_state "$sid")"; why="transcript"
-        elif [ "$agent" = agy ] && state="$(agy_state "$pane")"; then
-          why="screen"
-        elif [ "$others" != skip ]; then
-          state="$others"; why="--others"
-        else
-          echo "skip $pane ($agent, $status): no session record; pass --others fresh|session"
-          continue
-        fi ;;
-    esac
+    if [ "$agent" = codex ] && state="$(codex_state "$pane")"; then
+      why="welcome screen"
+    else
+      case "$status" in
+        working | blocked | done) state=session; why="status=$status" ;;
+        *)
+          if [ "$agent" = claude ] && [ -n "$sid" ]; then
+            state="$(claude_state "$sid")"; why="transcript"
+          elif [ "$agent" = agy ] && state="$(agy_state "$pane")"; then
+            why="screen"
+          elif [ "$others" != skip ]; then
+            state="$others"; why="--others"
+          else
+            echo "skip $pane ($agent, $status): no session record; pass --others fresh|session"
+            continue
+          fi ;;
+      esac
+    fi
     mark_pane "$pane" "$state" "$dry"
     [ -n "$dry" ] || echo "$pane $agent -> $state ($why)"
   done <<<"$agents"

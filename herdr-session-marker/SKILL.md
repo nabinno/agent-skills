@@ -54,14 +54,16 @@ After install, tell the user what still needs doing by hand:
 ```bash
 "$S" sync --dry-run          # preview
 "$S" sync                    # apply
+"$S" sync --agent codex      # refresh Codex panes only
 "$S" sync --others session   # also mark idle non-Claude panes (or: --others fresh)
 ```
 
 `sync` decides each pane in this order:
-1. `working` / `blocked` / `done` → ●.
-2. Claude with a Herdr session id → ● if its transcript (`<config>/projects/*/<id>.jsonl`) has an `assistant` entry, else ○. A `/clear`-only transcript has no assistant entry.
-3. Antigravity CLI (`agy`) → ○ if the recent terminal output shows only the `Antigravity CLI` banner and an empty prompt box, else ●.
-4. Other idle agents: Herdr holds no session id for them, so they are skipped unless `--others` is given. Look at the skipped panes and set them one by one:
+1. Codex → ○ if its visible screen still shows the untouched welcome banner and empty input prompt, including when Herdr reports `done` or `idle`.
+2. `working` / `blocked` / `done` → ●.
+3. Claude with a Herdr session id → ● if its transcript (`<config>/projects/*/<id>.jsonl`) has an `assistant` entry, else ○. A `/clear`-only transcript has no assistant entry.
+4. Antigravity CLI (`agy`) → ○ if the recent terminal output shows only the `Antigravity CLI` banner and an empty prompt box, else ●.
+5. Other idle agents: Herdr holds no session id for them, so they are skipped unless `--others` is given. Look at the skipped panes and set them one by one:
 
 ```bash
 herdr agent read <pane_id> --source visible --lines 40   # look for prior conversation
