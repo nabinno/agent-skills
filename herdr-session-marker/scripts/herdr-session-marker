@@ -219,21 +219,26 @@ claude_state() {
 }
 
 # Antigravity CLI: an empty or /clear-ed screen shows the Antigravity CLI logo
-# followed only by blank lines and the bottom prompt box (─── / > / ───).
+# (plus any startup ┃ notice banner) followed only by blank lines and the
+# bottom prompt box (─── / > ... / ───), with no prior turn separator rules.
 agy_state() {
   local pane="$1" text
   text="$("$HERDR" agent read "$pane" --source recent --lines 50 2>/dev/null)" || return 1
   [ -n "$text" ] || return 1
   if awk '
     /Antigravity CLI/ { saw_banner=1 }
-    /▄▀▀[[:space:]]+▀▀▄/ { after_logo=1; body=0; saw_rule=0; next }
+    /▄▀▀[[:space:]]+▀▀▄/ { after_logo=1; body=0; saw_rule=0; saw_prompt=0; next }
     after_logo {
       if ($0 ~ /^[[:space:]]*─{20,}[[:space:]]*$/) { saw_rule++; next }
-      if (saw_rule == 1 && $0 ~ /^[[:space:]]*>[[:space:]]*$/) { next }
+      if (saw_rule == 0 && $0 ~ /^[[:space:]]*┃/) { next }
+      if (saw_rule == 1) {
+        if ($0 ~ /^[[:space:]]*>/) { saw_prompt=1 }
+        next
+      }
       if (saw_rule >= 2) { next }
       if ($0 ~ /[^[:space:]]/) { body=1 }
     }
-    END { exit (saw_banner && after_logo && !body) ? 0 : 1 }
+    END { exit (saw_banner && after_logo && saw_rule == 2 && saw_prompt && !body) ? 0 : 1 }
   ' <<<"$text"; then
     echo fresh
   else
