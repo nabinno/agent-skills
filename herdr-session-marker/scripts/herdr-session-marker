@@ -9,6 +9,7 @@
 #
 # Usage:
 #   herdr-session-marker hook <agent> [event]   CLI hook entry point (stdin = hook JSON)
+#   herdr-session-marker statusline agy         Antigravity CLI statusLine entry point
 #   herdr-session-marker sync [--others fresh|session|skip] [--dry-run]
 #                                               mark every agent pane in the session
 #   herdr-session-marker set <pane_id> fresh|session
@@ -103,7 +104,93 @@ hook() {
     UserPromptSubmit | PreInvocation) state=session ;;
     *) exit 0 ;;
   esac
-  mark_pane "$HERDR_PANE_ID" "$state"
+  if mark_pane "$HERDR_PANE_ID" "$state" && [ "$agent" = agy ]; then
+    agy_write_cache "$HERDR_PANE_ID" "$state"
+  fi
+  exit 0
+}
+
+# Find the enclosing agy process PID so the per-pane cache resets when a new
+# agy starts in the same pane (agy runs statusLine/hooks via `sh -c`).
+agy_ancestor_pid() {
+  local pid="$PPID" i comm
+  for i in 1 2 3 4 5 6; do
+    [ -r "/proc/$pid/comm" ] || break
+    comm="$(<"/proc/$pid/comm")"
+    case "$comm" in
+      sh | dash | bash | zsh) ;;
+      *) echo "$pid"; return 0 ;;
+    esac
+    pid="$(awk -F') ' '{split($2,a," "); print a[2]}' "/proc/$pid/stat" 2>/dev/null)" || break
+    [ -n "$pid" ] && [ "$pid" -gt 1 ] || break
+  done
+  echo "$PPID"
+}
+
+agy_cache_file() {
+  printf '%s/herdr-session-marker-agy-%s.state' "${XDG_RUNTIME_DIR:-/tmp}" "${1//:/_}"
+}
+
+agy_write_cache() {
+  printf '%s %s' "$(agy_ancestor_pid)" "$2" >"$(agy_cache_file "$1")" 2>/dev/null || true
+}
+
+# statusline agy [--wrap-b64 <base64>]
+# Antigravity CLI's SessionStart hook fires only right before the first model
+# invocation (never on startup, /clear, or /new). statusLine fires on startup,
+# /clear, /new, /resume, and every state tick with token counts and agent_state.
+statusline() {
+  local agent="${1:-}" wrap_b64="" input
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --wrap-b64) wrap_b64="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  input="$(cat)"
+  if [ -n "$wrap_b64" ]; then
+    local orig_cmd
+    orig_cmd="$(printf '%s' "$wrap_b64" | base64 -d 2>/dev/null || true)"
+    [ -n "$orig_cmd" ] && sh -c "$orig_cmd" <<<"$input"
+  fi
+  [ "$agent" = agy ] || exit 0
+  [ -n "${HERDR_PANE_ID:-}" ] || exit 0
+  have_herdr || exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+
+  local parsed agent_state in_tok out_tok has_usage title state
+  parsed="$(jq -r '[
+    (.agent_state // ""),
+    (.context_window.total_input_tokens // 0 | tostring),
+    (.context_window.total_output_tokens // 0 | tostring),
+    (if .context_window.current_usage != null then "1" else "0" end),
+    (.conversation_title // "")
+  ] | join("\u001f")' <<<"$input" 2>/dev/null)" || exit 0
+  IFS=$'\x1f' read -r agent_state in_tok out_tok has_usage title <<<"$parsed"
+
+  # Wait until startup/resume finishes loading before updating the mark.
+  [ "$agent_state" = authenticating ] && exit 0
+
+  if [ "${in_tok:-0}" -gt 0 ] 2>/dev/null \
+    || [ "${out_tok:-0}" -gt 0 ] 2>/dev/null \
+    || [ "$has_usage" = 1 ] \
+    || [ -n "$title" ] \
+    || { [ -n "$agent_state" ] && [ "$agent_state" != idle ]; }; then
+    state=session
+  else
+    state=fresh
+  fi
+
+  local cache_file key
+  cache_file="$(agy_cache_file "$HERDR_PANE_ID")"
+  key="$(agy_ancestor_pid) $state"
+  if [ -r "$cache_file" ] && [ "$(<"$cache_file")" = "$key" ]; then
+    exit 0
+  fi
+  if mark_pane "$HERDR_PANE_ID" "$state"; then
+    printf '%s' "$key" >"$cache_file" 2>/dev/null || true
+  fi
   exit 0
 }
 
@@ -131,6 +218,29 @@ claude_state() {
   if [ -n "$f" ] && grep -q '"type":"assistant"' "$f"; then echo session; else echo fresh; fi
 }
 
+# Antigravity CLI: an empty or /clear-ed screen shows the Antigravity CLI logo
+# followed only by blank lines and the bottom prompt box (─── / > / ───).
+agy_state() {
+  local pane="$1" text
+  text="$("$HERDR" agent read "$pane" --source recent --lines 50 2>/dev/null)" || return 1
+  [ -n "$text" ] || return 1
+  if awk '
+    /Antigravity CLI/ { saw_banner=1 }
+    /▄▀▀[[:space:]]+▀▀▄/ { after_logo=1; body=0; saw_rule=0; next }
+    after_logo {
+      if ($0 ~ /^[[:space:]]*─{20,}[[:space:]]*$/) { saw_rule++; next }
+      if (saw_rule == 1 && $0 ~ /^[[:space:]]*>[[:space:]]*$/) { next }
+      if (saw_rule >= 2) { next }
+      if ($0 ~ /[^[:space:]]/) { body=1 }
+    }
+    END { exit (saw_banner && after_logo && !body) ? 0 : 1 }
+  ' <<<"$text"; then
+    echo fresh
+  else
+    echo session
+  fi
+}
+
 sync_all() {
   local others=skip dry=""
   while [ $# -gt 0 ]; do
@@ -156,6 +266,8 @@ sync_all() {
       *)
         if [ "$agent" = claude ] && [ -n "$sid" ]; then
           state="$(claude_state "$sid")"; why="transcript"
+        elif [ "$agent" = agy ] && state="$(agy_state "$pane")"; then
+          why="screen"
         elif [ "$others" != skip ]; then
           state="$others"; why="--others"
         else
@@ -252,8 +364,10 @@ install_all() {
     echo "$mode: $f"
   fi
 
-  # Antigravity CLI: hooks.json keyed by hook name; non-tool events take a flat
-  # handler list (a matcher/hooks wrapper invalidates the whole file).
+  # Antigravity CLI hooks: hooks.json keyed by hook name; non-tool events take a
+  # flat handler list (a matcher/hooks wrapper invalidates the whole file).
+  # Only PreInvocation is registered here because agy's SessionStart fires only
+  # right before the first model call, never on startup, /clear, or /new.
   d="${ANTIGRAVITY_CLI_CONFIG_DIR:-${GEMINI_CONFIG_DIR:-$HOME/.gemini/config}}"
   if [ -d "$d" ]; then
     f="$d/hooks.json"
@@ -262,10 +376,49 @@ install_all() {
     jq --arg name "$HOOK_NAME" --arg cmd "$SELF hook agy" --arg mode "$mode" '
       del(.[$name])
       | if $mode == "install" then .[$name] = {
-          SessionStart: [{type: "command", command: ($cmd + " SessionStart"), timeout: 5}],
           PreInvocation: [{type: "command", command: ($cmd + " PreInvocation"), timeout: 5}]}
         else . end' "$f" >"$tmp" && mv "$tmp" "$f"
     echo "$mode: $f"
+  fi
+
+  # Antigravity CLI statusLine: runs on startup, /clear, /new, /resume, and state
+  # updates with token counts and agent_state, which catches empty sessions that
+  # SessionStart misses. Preserves any existing user statusLine.command via --wrap-b64.
+  d="${ANTIGRAVITY_CLI_DATA_DIR:-$HOME/.gemini/antigravity-cli}"
+  if [ -d "$d" ]; then
+    f="$d/settings.json"
+    if [ -f "$f" ]; then cp "$f" "$f.bak-herdr-session-marker"; else echo '{}' >"$f"; fi
+    local cur_cmd wrap_b64="" sl_cmd orig_cmd tmp
+    cur_cmd="$(jq -r '.statusLine.command // empty' "$f" 2>/dev/null)"
+    if [ "$mode" = install ]; then
+      case "$cur_cmd" in
+        *"$HOOK_NAME"*"--wrap-b64 "*)
+          wrap_b64="${cur_cmd#*--wrap-b64 }"
+          wrap_b64="${wrap_b64%% *}" ;;
+        "" | *"$HOOK_NAME"*) ;;
+        *)
+          wrap_b64="$(printf '%s' "$cur_cmd" | base64 -w0 2>/dev/null || printf '%s' "$cur_cmd" | base64 | tr -d '\n')" ;;
+      esac
+      sl_cmd="$SELF statusline agy"
+      [ -n "$wrap_b64" ] && sl_cmd="$sl_cmd --wrap-b64 $wrap_b64"
+      tmp="$(mktemp)"
+      jq --arg cmd "$sl_cmd" '.statusLine = {type: "command", command: $cmd, enabled: true}' "$f" >"$tmp" && mv "$tmp" "$f"
+      echo "$mode: $f"
+    else
+      case "$cur_cmd" in
+        *"$HOOK_NAME"*)
+          tmp="$(mktemp)"
+          if [[ "$cur_cmd" == *"--wrap-b64 "* ]]; then
+            wrap_b64="${cur_cmd#*--wrap-b64 }"
+            wrap_b64="${wrap_b64%% *}"
+            orig_cmd="$(printf '%s' "$wrap_b64" | base64 -d 2>/dev/null || true)"
+            jq --arg cmd "$orig_cmd" '.statusLine.command = $cmd' "$f" >"$tmp" && mv "$tmp" "$f"
+          else
+            jq '.statusLine = {type: "", command: "", enabled: (.statusLine.enabled // true)}' "$f" >"$tmp" && mv "$tmp" "$f"
+          fi
+          echo "$mode: $f" ;;
+      esac
+    fi
   fi
 }
 
@@ -274,11 +427,12 @@ install_all() {
 cmd="${1:-}"; shift || true
 case "$cmd" in
   hook) hook "$@" ;;
+  statusline) statusline "$@" ;;
   sync) sync_all "$@" ;;
   set) set_one "$@" ;;
   unmark) unmark "$@" ;;
   status) status_all ;;
   install) install_all install ;;
   uninstall) install_all uninstall ;;
-  *) sed -n '2,19p' "$SELF" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] || exit 1 ;;
+  *) sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] || exit 1 ;;
 esac

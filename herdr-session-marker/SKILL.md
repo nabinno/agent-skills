@@ -30,18 +30,19 @@ This registers `"$S" hook <agent>` in each CLI and backs up each edited file to 
 | Claude Code | `settings.json` in `$CLAUDE_CONFIG_DIR`, `~/.claude-bedrock`, `~/.claude` (those that exist) | `SessionStart`, `UserPromptSubmit` |
 | Codex | `${CODEX_HOME:-~/.codex}/hooks.json` | `SessionStart`, `UserPromptSubmit` |
 | Grok | `${GROK_HOME:-~/.grok}/hooks/herdr-session-marker.json` | `SessionStart`, `UserPromptSubmit` |
-| Antigravity CLI | `~/.gemini/config/hooks.json`, block `herdr-session-marker` | `SessionStart`, `PreInvocation` (flat handler lists) |
+| Antigravity CLI | `~/.gemini/config/hooks.json` (`herdr-session-marker`) & `~/.gemini/antigravity-cli/settings.json` (`statusLine`) | `PreInvocation` + `statusLine` (startup, `/clear`, `/new`, `/resume`) |
 
 The hook maps events to marks:
 
 | Mark | Event |
 |---|---|
 | ○ | `SessionStart` with source `startup`/`clear` (Claude, Codex) or `new` (Grok: `/new`, `/clear`) |
-| ○ | Antigravity CLI `SessionStart`, which carries no source, unless the CLI process was started with `--conversation`/`--resume`/`--continue` |
+| ○ | Antigravity CLI `statusLine` when `agent_state` is `idle` with zero tokens / no `current_usage` / no `conversation_title` (fresh startup, `/clear`, `/new`). `agy`'s `SessionStart` hook only fires right before the first model call, so `statusLine` is used instead; any existing `statusLine.command` is wrapped and preserved. |
 | ● | `SessionStart` with source `resume`/`compact`/`load` |
+| ● | Antigravity CLI `statusLine` with non-zero tokens, `current_usage`, `conversation_title`, or non-idle `agent_state` (including `/resume`, `--conversation`, `--continue`) |
 | ● | `UserPromptSubmit` / `PreInvocation` |
 
-The hook does nothing when `HERDR_PANE_ID` is unset. It renames only when the label changes, prints nothing (except `{}` for Antigravity CLI, which requires a JSON object), and always exits 0.
+The hook does nothing when `HERDR_PANE_ID` is unset. It renames only when the label changes, prints nothing (except `{}` for Antigravity CLI hooks, which require a JSON object; `statusline` stays silent unless wrapping a user command), and always exits 0.
 
 After install, tell the user what still needs doing by hand:
 - Running CLIs pick up the hooks on their next start. Claude Code also reloads settings while running.
@@ -59,7 +60,8 @@ After install, tell the user what still needs doing by hand:
 `sync` decides each pane in this order:
 1. `working` / `blocked` / `done` → ●.
 2. Claude with a Herdr session id → ● if its transcript (`<config>/projects/*/<id>.jsonl`) has an `assistant` entry, else ○. A `/clear`-only transcript has no assistant entry.
-3. Other idle agents: Herdr holds no session id for them, so they are skipped unless `--others` is given. Look at the skipped panes and set them one by one:
+3. Antigravity CLI (`agy`) → ○ if the recent terminal output shows only the `Antigravity CLI` banner and an empty prompt box, else ●.
+4. Other idle agents: Herdr holds no session id for them, so they are skipped unless `--others` is given. Look at the skipped panes and set them one by one:
 
 ```bash
 herdr agent read <pane_id> --source visible --lines 40   # look for prior conversation
